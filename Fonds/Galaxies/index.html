@@ -1,0 +1,777 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Galaxies en collision — fond d'écran animé</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden}
+  canvas{position:fixed;inset:0;width:100vw;height:100vh;display:block}
+  #err{position:fixed;inset:0;display:none;align-items:center;justify-content:center;color:#888;font:14px -apple-system,sans-serif}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="err">WebGL 2 indisponible</div>
+
+<!-- ================= Mise à jour des étoiles (GPU, transform feedback) ================= -->
+<script id="vsUpdate" type="x-shader">#version 300 es
+precision highp float;
+precision highp int;
+layout(location=0) in vec4 aPos;   // xyz, âge
+layout(location=1) in vec4 aVel;   // xyz, durée de vie
+layout(location=2) in vec4 aInfo;  // galaxie hôte, type, génération, -
+out vec4 vPos; out vec4 vVel; out vec4 vInfo;
+
+uniform float uDt, uTime;
+uniform vec3 uCore[2], uCoreVel[2], uKick[2];
+uniform vec4 uMass[2];                 // Mnoyau, a_noyau, Mhalo, a_halo
+uniform vec3 uN[2], uE1[2], uE2[2];    // repère du disque
+uniform vec4 uGal0[2];                 // Rd, Rmax, tan(pitch), nb bras
+uniform vec4 uGal1[2];                 // phase des bras, épaisseur, taille bulbe, -
+
+const float TAU = 6.2831853;
+
+uint pcg(uint v){
+  uint s = v * 747796405u + 2891336453u;
+  uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+  return (w >> 22u) ^ w;
+}
+float rnd(inout uint s){ s = pcg(s); return float(s) * (1.0 / 4294967296.0); }
+float gauss(inout uint s){
+  float u1 = max(rnd(s), 1e-7), u2 = rnd(s);
+  return sqrt(-2.0 * log(u1)) * cos(TAU * u2);
+}
+
+vec3 accel(vec3 p){
+  vec3 a = vec3(0.0);
+  for(int k = 0; k < 2; k++){
+    vec3 d = uCore[k] - p;
+    float r2 = dot(d, d);
+    vec4 M = uMass[k];
+    float ic = inversesqrt(r2 + M.y*M.y);
+    float ih = inversesqrt(r2 + M.w*M.w);
+    a += d * (M.x*ic*ic*ic + M.z*ih*ih*ih);
+  }
+  return a;
+}
+float vcirc(int k, float r){
+  vec4 M = uMass[k];
+  float r2 = r*r;
+  float ic = inversesqrt(r2 + M.y*M.y);
+  float ih = inversesqrt(r2 + M.w*M.w);
+  return sqrt(r2 * (M.x*ic*ic*ic + M.z*ih*ih*ih));
+}
+float armAngle(int k, float r, float idx){
+  return uGal1[k].x - log(max(r, 0.05) / 0.2) / uGal0[k].z + idx * TAU / uGal0[k].w;
+}
+
+void spawn(int k, float type, inout uint s, out vec3 p, out vec3 v, out float life){
+  vec4 g0 = uGal0[k], g1 = uGal1[k];
+  float Rd = g0.x, Rmax = g0.y;
+  vec3 N = uN[k], E1 = uE1[k], E2 = uE2[k];
+
+  if(type > 2.5){                               // bulbe
+    vec3 q = vec3(gauss(s), gauss(s), gauss(s) * 0.65) * g1.z;
+    p = uCore[k] + q.x*E1 + q.y*E2 + q.z*N;
+    float rr = length(q);
+    float vc = vcirc(k, max(rr, g1.z));
+    vec3 t = normalize(cross(N, q.x*E1 + q.y*E2 + 1e-5*E1));
+    v = uCoreVel[k] + vec3(gauss(s), gauss(s), gauss(s)) * vc * 0.5 + t * vc * 0.35;
+    life = 60.0 + 140.0 * rnd(s);
+    return;
+  }
+
+  float r, th, z;
+  if(type < 0.5){                               // vieux disque
+    float u = rnd(s);
+    r = max(-Rd * log(1.0 - u * (1.0 - exp(-Rmax / Rd))), 0.03);
+    th = rnd(s) < 0.45 ? armAngle(k, r, floor(rnd(s) * g0.w)) + gauss(s) * 0.4 : rnd(s) * TAU;
+    z = gauss(s) * g1.y * (0.5 + r);
+    life = 30.0 + 90.0 * rnd(s);
+  } else {                                      // jeunes étoiles (1) et nébuleuses (2) en amas le long des bras
+    float ci = floor(rnd(s) * 90.0);
+    float ep = floor(uTime / 9.0 + fract(ci * 0.618034));
+    uint cs = pcg(uint(k) * 7919u + uint(ci) * 104729u + uint(ep) * 15485863u);
+    float cr = mix(Rd * 0.6, Rmax * 0.95, pow(rnd(cs), 0.8));
+    float cth = armAngle(k, cr, floor(rnd(cs) * g0.w)) + (rnd(cs) - 0.5) * 0.3;
+    float spread = (type < 1.5 ? 0.035 : 0.07) * (0.6 + 0.4 * cr);
+    vec2 xy = cr * vec2(cos(cth), sin(cth)) + vec2(gauss(s), gauss(s)) * spread;
+    r = max(length(xy), 0.05); th = atan(xy.y, xy.x);
+    z = gauss(s) * g1.y * 0.35;
+    life = type < 1.5 ? 12.0 + 23.0 * rnd(s) : 8.0 + 12.0 * rnd(s);
+  }
+  vec3 radial = cos(th)*E1 + sin(th)*E2;
+  vec3 tang   = -sin(th)*E1 + cos(th)*E2;
+  p = uCore[k] + r*radial + z*N;
+  float vc = vcirc(k, r);
+  v = uCoreVel[k] + vc*tang + vec3(gauss(s), gauss(s), gauss(s)) * vc * (type < 0.5 ? 0.07 : 0.025);
+}
+
+void main(){
+  vec3 p = aPos.xyz; float age = aPos.w;
+  vec3 v = aVel.xyz; float life = aVel.w;
+  int k = int(aInfo.x + 0.5);
+  float type = aInfo.y, gen = aInfo.z;
+
+  // les étoiles perdues loin des galaxies s'éteignent plus vite (les queues finissent par se dissiper)
+  float dmin = min(distance(p, uCore[0]), distance(p, uCore[1]));
+  age += uDt * (1.0 + 2.5 * smoothstep(5.0, 10.0, dmin));
+  if(!(dot(p, p) < 1e6)) age = life + 1.0;     // sécurité NaN / fuite
+
+  if(age >= life){
+    uint s = pcg(uint(gl_VertexID) * 2654435761u ^ pcg(uint(gen) * 97u + 12345u));
+    spawn(k, type, s, p, v, life);
+    age = gen < 0.5 ? rnd(s) * life : 0.0;
+    gen += 1.0;
+  } else {
+    v += (accel(p) + uKick[k]) * uDt;
+    p += v * uDt;
+  }
+  vPos = vec4(p, age); vVel = vec4(v, life); vInfo = vec4(aInfo.x, type, gen, 0.0);
+}
+</script>
+<script id="fsNull" type="x-shader">#version 300 es
+precision mediump float; out vec4 o; void main(){ o = vec4(0.0); }
+</script>
+
+<!-- ================= Rendu des étoiles ================= -->
+<script id="vsStars" type="x-shader">#version 300 es
+precision highp float;
+layout(location=0) in vec4 aPos;
+layout(location=1) in vec4 aVel;
+layout(location=2) in vec4 aInfo;
+uniform mat4 uVP;
+uniform float uPixScale, uBright;
+uniform vec3 uTintOld[2], uTintYoung[2], uTintGas[2];
+out vec3 vCol;
+out float vSoft;
+void main(){
+  vec4 c = uVP * vec4(aPos.xyz, 1.0);
+  gl_Position = c;
+  int k = int(aInfo.x + 0.5);
+  float type = aInfo.y, age = aPos.w, life = aVel.w;
+  float fade = smoothstep(0.0, 1.0, age) * (1.0 - smoothstep(life - 2.5, life, age));
+  float ws, I; vec3 col; vSoft = 6.0;   // cœur resserré : étoiles piquées plutôt que floues
+  if(type < 0.5){ ws = 0.010; I = 1.0; col = uTintOld[k]; }
+  else if(type < 1.5){
+    float t = clamp(age / life, 0.0, 1.0);
+    ws = 0.011; I = 1.3 * (1.0 - 0.55 * t);
+    col = mix(uTintYoung[k], vec3(1.0, 0.95, 0.88), t);
+  }
+  else if(type < 2.5){
+    ws = 0.07; I = 0.045; col = uTintGas[k]; vSoft = 2.0;   // le gaz reste diffus
+    fade *= sin(3.14159 * clamp(age / life, 0.0, 1.0));
+  }
+  else { ws = 0.010; I = 1.25; col = uTintOld[k] * vec3(1.0, 0.82, 0.62); }
+
+  float px = ws * uPixScale / max(c.w, 0.05);
+  const float MINPX = 0.9;
+  if(px < MINPX){ I *= (px / MINPX) * (px / MINPX); px = MINPX; }
+  px = min(px, 48.0);
+  gl_PointSize = 1.7 * px;   // moins de bord flou autour de chaque étoile
+  vCol = c.w > 0.0 ? col * I * fade * uBright : vec3(0.0);
+}
+</script>
+<script id="fsStars" type="x-shader">#version 300 es
+precision highp float;
+in vec3 vCol; in float vSoft;
+out vec4 o;
+void main(){
+  vec2 d = gl_PointCoord * 2.0 - 1.0;
+  float r2 = dot(d, d);
+  if(r2 > 1.0) discard;
+  o = vec4(vCol * exp(-r2 * vSoft) * (1.0 - r2), 1.0);
+}
+</script>
+
+<!-- ================= Post-traitement ================= -->
+<script id="vsQuad" type="x-shader">#version 300 es
+out vec2 vUv;
+void main(){
+  vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+  vUv = p;
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+</script>
+<script id="fsDown" type="x-shader">#version 300 es
+precision highp float;
+in vec2 vUv; out vec4 o;
+uniform sampler2D uTex; uniform vec2 uTexel;
+void main(){
+  vec2 h = uTexel;
+  vec4 s = texture(uTex, vUv) * 4.0;
+  s += texture(uTex, vUv + vec2(-h.x, -h.y));
+  s += texture(uTex, vUv + vec2( h.x,  h.y));
+  s += texture(uTex, vUv + vec2( h.x, -h.y));
+  s += texture(uTex, vUv + vec2(-h.x,  h.y));
+  o = s / 8.0;
+}
+</script>
+<script id="fsUp" type="x-shader">#version 300 es
+precision highp float;
+in vec2 vUv; out vec4 o;
+uniform sampler2D uTex; uniform vec2 uTexel;
+void main(){
+  vec2 h = uTexel;
+  vec4 s = texture(uTex, vUv + vec2(-2.0*h.x, 0.0));
+  s += texture(uTex, vUv + vec2(-h.x,  h.y)) * 2.0;
+  s += texture(uTex, vUv + vec2(0.0, 2.0*h.y));
+  s += texture(uTex, vUv + vec2( h.x,  h.y)) * 2.0;
+  s += texture(uTex, vUv + vec2(2.0*h.x, 0.0));
+  s += texture(uTex, vUv + vec2( h.x, -h.y)) * 2.0;
+  s += texture(uTex, vUv + vec2(0.0, -2.0*h.y));
+  s += texture(uTex, vUv + vec2(-h.x, -h.y)) * 2.0;
+  o = s / 12.0;
+}
+</script>
+<script id="fsComposite" type="x-shader">#version 300 es
+precision highp float;
+in vec2 vUv; out vec4 o;
+uniform sampler2D uScene, uBloom;
+uniform vec3 uCamR, uCamU, uCamF;
+uniform vec2 uTan;
+uniform float uPix, uExposure, uBloomAmt, uFrame;
+
+float hash13(vec3 p3){ p3 = fract(p3 * 0.1031); p3 += dot(p3, p3.zyx + 31.32); return fract((p3.x + p3.y) * p3.z); }
+vec3 hash33(vec3 p3){ p3 = fract(p3 * vec3(0.1031, 0.1030, 0.0973)); p3 += dot(p3, p3.yxz + 33.33); return fract((p3.xxy + p3.yxx) * p3.zyx); }
+
+vec3 starLayer(vec3 d, float scale, float density, float seed, float wmul){
+  vec3 id = floor(d * scale);
+  vec3 h = hash33(id + seed);
+  if(h.x > density) return vec3(0.0);
+  vec3 sp = normalize(id + 0.2 + 0.6 * hash33(id * 1.7 + seed + 3.1));
+  float dist = length(d - sp);
+  float w = uPix * wmul;
+  float mag = pow(hash13(id + seed + 7.7), 6.0) * 1.6 + 0.08;
+  vec3 tint = mix(vec3(1.0, 0.8, 0.62), vec3(0.72, 0.82, 1.0), h.z);
+  return tint * mag * exp(-dist*dist / (w*w));
+}
+vec3 background(vec3 d){
+  vec3 c = vec3(0.0015, 0.002, 0.004);
+  c += starLayer(d,  80.0, 0.05, 0.0, 0.9) * 0.5;
+  c += starLayer(d, 190.0, 0.03, 11.0, 0.8) * 0.25;
+  c += starLayer(d,  25.0, 0.04, 29.0, 2.5) * vec3(0.10, 0.08, 0.09);   // galaxies lointaines
+  return c;
+}
+vec3 aces(vec3 x){ return clamp((x*(2.51*x + 0.03)) / (x*(2.43*x + 0.59) + 0.14), 0.0, 1.0); }
+
+void main(){
+  vec3 hdr = texture(uScene, vUv).rgb + texture(uBloom, vUv).rgb * uBloomAmt;
+  vec3 dir = normalize(uCamF + (vUv.x * 2.0 - 1.0) * uTan.x * uCamR + (vUv.y * 2.0 - 1.0) * uTan.y * uCamU);
+  vec3 col = aces((hdr + background(dir)) * uExposure);
+  vec2 q = vUv;
+  col *= 0.6 + 0.4 * pow(16.0 * q.x * q.y * (1.0 - q.x) * (1.0 - q.y), 0.2);
+  col = pow(col, vec3(1.0 / 2.2));
+  col += (hash13(vec3(gl_FragCoord.xy, uFrame)) - 0.5) / 255.0;
+  o = vec4(col, 1.0);
+}
+</script>
+
+<script>
+(function(){
+'use strict';
+// Paramètres via l'URL : ?n=150000&fps=30&speed=1&q=0&bright=1
+const QS = new URLSearchParams(location.search);
+const num = (k, d) => (QS.has(k) && !isNaN(+QS.get(k))) ? +QS.get(k) : d;
+const CFG = {
+  n: Math.max(10000, Math.round(num('n', 360000))),
+  fps: num('fps', 30),
+  speed: num('speed', 1),          // 1 = une rencontre toutes les ~2–3 min
+  q: num('q', 0),                  // échelle de résolution (0 = auto)
+  bright: num('bright', 1),
+  sim: Math.max(1, Math.round(num('sim', 2))),      // une simulation toutes les N images
+  bloomEvery: Math.max(1, Math.round(num('bloom', 2))), // un calcul de halo toutes les N images
+  fov: 34,
+};
+const TIME_SCALE = 0.22;           // unités de simulation par seconde réelle
+
+// ---------------- utilitaires ----------------
+const rand = (a, b) => a + Math.random() * (b - a);
+const gaussR = () => Math.sqrt(-2 * Math.log(Math.max(Math.random(), 1e-9))) * Math.cos(2 * Math.PI * Math.random());
+const add = (a, b) => [a[0]+b[0], a[1]+b[1], a[2]+b[2]];
+const sub = (a, b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+const mul = (a, s) => [a[0]*s, a[1]*s, a[2]*s];
+const dot = (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+const cross = (a, b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+const len = a => Math.hypot(a[0], a[1], a[2]);
+const norm = a => { const l = len(a) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
+const randUnit = () => norm([gaussR(), gaussR(), gaussR()]);
+function rotAxis(v, axis, ang){   // Rodrigues
+  const c = Math.cos(ang), s = Math.sin(ang), k = axis;
+  return add(add(mul(v, c), mul(cross(k, v), s)), mul(k, dot(k, v) * (1 - c)));
+}
+function perpBasis(n, prevE1){
+  let e1 = prevE1 ? sub(prevE1, mul(n, dot(prevE1, n))) : null;
+  if(!e1 || len(e1) < 1e-3){ e1 = Math.abs(n[1]) < 0.9 ? cross(n, [0,1,0]) : cross(n, [1,0,0]); }
+  e1 = norm(e1);
+  return [e1, cross(n, e1)];
+}
+// bruit lisse quasi-périodique (ne se répète jamais exactement)
+function makeWander(){
+  const comps = [0,1,2].map(() => ({ f: 2*Math.PI / rand(70, 320), p: rand(0, 6.283), a: rand(0.6, 1) }));
+  const tot = comps.reduce((s, c) => s + c.a, 0);
+  return t => comps.reduce((s, c) => s + c.a * Math.sin(c.f * t + c.p), 0) / tot;
+}
+
+// ---------------- galaxies ----------------
+function randomLook(g){
+  g.Rd = rand(0.42, 0.6) * g.size;
+  g.Rmax = rand(1.5, 2.1) * g.size;
+  g.arms = Math.random() < 0.65 ? 2 : (Math.random() < 0.6 ? 3 : 4);
+  g.tanPitch = Math.tan(rand(11, 24) * Math.PI / 180);
+  g.thick = rand(0.02, 0.045) * g.size;
+  g.bulge = rand(0.09, 0.2) * g.size;
+  const warm = rand(0, 1), cool = rand(0, 1);
+  // Les teintes ne sont plus appliquées d'un coup : ce sont des cibles, vers
+  // lesquelles les couleurs courantes glissent en une vingtaine de secondes.
+  // Sans cela, une galaxie bleue devenait rose d'une image à l'autre.
+  const rose = [1.0, 0.28 + 0.15*cool, 0.55 + 0.2*warm];
+  const bleu = [0.45, 0.55, 1.0];
+  const m = 0.25 + 0.75 * Math.random();     // mélange continu, jamais un basculement
+  g.cibleOld = [1.0, 0.80 + 0.12*warm, 0.58 + 0.2*warm];
+  g.cibleYoung = [0.55 + 0.25*cool, 0.70 + 0.15*cool, 1.0];
+  g.cibleGas = [bleu[0] + (rose[0]-bleu[0])*m,
+                bleu[1] + (rose[1]-bleu[1])*m,
+                bleu[2] + (rose[2]-bleu[2])*m];
+  // À la création, la couleur est déjà la bonne ; ensuite on fond.
+  if(!g.tintOld){ g.tintOld = g.cibleOld.slice(); g.tintYoung = g.cibleYoung.slice(); g.tintGas = g.cibleGas.slice(); }
+}
+
+/// Rapproche doucement les couleurs de leur cible (constante de temps ~20 s).
+function fondreTeintes(g, dt){
+  const k = 1 - Math.exp(-dt / 20);
+  for(const [courant, cible] of [[g.tintOld, g.cibleOld], [g.tintYoung, g.cibleYoung], [g.tintGas, g.cibleGas]]){
+    for(let i = 0; i < 3; i++) courant[i] += (cible[i] - courant[i]) * k;
+  }
+}
+function makeGalaxy(scale){
+  const g = { size: Math.pow(scale, 0.45) };
+  g.Mc = rand(0.18, 0.32) * scale; g.ac = 0.16 * g.size;
+  g.Mh = rand(0.85, 1.15) * scale; g.ah = rand(0.65, 0.95) * g.size;
+  g.M = g.Mc + g.Mh;
+  g.n = randUnit();
+  [g.e1, g.e2] = perpBasis(g.n);
+  g.w = [0, 0, 0];                // vitesse angulaire de la dérive du disque
+  g.phase = rand(0, 6.283);
+  g.x = [0,0,0]; g.v = [0,0,0];
+  randomLook(g);
+  return g;
+}
+function vcircJS(g, r){
+  const r2 = r*r;
+  return Math.sqrt(r2 * (g.Mc * Math.pow(r2 + g.ac*g.ac, -1.5) + g.Mh * Math.pow(r2 + g.ah*g.ah, -1.5)));
+}
+const G = [makeGalaxy(1.0), makeGalaxy(rand(0.5, 0.95))];
+const Mt = G[0].M + G[1].M;
+
+function relForce(r2){  // force mutuelle / r (approximation Plummer)
+  const A = G[0], B = G[1];
+  const pairs = [[A.Mc, A.ac, B.Mc, B.ac], [A.Mc, A.ac, B.Mh, B.ah], [A.Mh, A.ah, B.Mc, B.ac], [A.Mh, A.ah, B.Mh, B.ah]];
+  let f = 0;
+  for(const [m1, a1, m2, a2] of pairs) f += m1 * m2 * Math.pow(r2 + a1*a1 + a2*a2, -1.5);
+  return f;
+}
+
+// conditions initiales : première rencontre assez rapide
+(function initOrbit(){
+  const r = rand(4.5, 5.5), rp = rand(0.9, 1.9);
+  const vt = Math.sqrt(2 * Mt * rp / (r * (r + rp))) * 0.95;
+  const d = [r, 0, 0], dv = [-0.18, 0, vt];
+  G[0].x = mul(d, -G[1].M / Mt); G[1].x = mul(d, G[0].M / Mt);
+  G[0].v = mul(dv, -G[1].M / Mt); G[1].v = mul(dv, G[0].M / Mt);
+})();
+
+// ---------------- dynamique des noyaux + régulateur aléatoire ----------------
+let kick = { a: [0,0,0], until: -1 };
+let simT = 0, prevVr = 0, prevR = 99, minSep = 99;
+
+function coreAcc(){
+  const d = sub(G[1].x, G[0].x);
+  const f = relForce(dot(d, d));
+  const F = mul(d, f);            // force sur G0 (vers G1)
+  let a0 = mul(F, 1 / G[0].M), a1 = mul(F, -1 / G[1].M);
+  let k0 = [0,0,0], k1 = [0,0,0];
+  if(simT < kick.until){
+    k0 = mul(kick.a, -G[1].M / Mt);
+    k1 = mul(kick.a,  G[0].M / Mt);
+  }
+  return [add(a0, k0), add(a1, k1), k0, k1];
+}
+
+function effMass(r){ return relForce(r*r) * r*r*r * Mt / (G[0].M * G[1].M); }
+
+function onApocenter(r, d, dv){
+  // nouvelle géométrie de rencontre : distance au péricentre + rotation du plan orbital
+  const u = Math.random();
+  const rp = u < 0.3 ? rand(0.15, 0.8) : u < 0.7 ? rand(1.0, 2.0) : rand(2.0, 2.8);
+  const dh = norm(d);
+  const vr = dot(dv, dh);
+  let t = sub(dv, mul(dh, vr));
+  if(len(t) < 1e-4) t = perpBasis(dh)[0];
+  t = norm(rotAxis(norm(t), dh, Math.max(-1.8, Math.min(1.8, gaussR() * 0.9))));
+  const Me = effMass(r);
+  const vt = Math.sqrt(2 * Me * rp / (r * (r + rp)));
+  let target = mul(t, vt);
+  if(r < 4.0) target = add(target, mul(dh, 0.35));   // orbite trop serrée → on les écarte
+  const tau = 2.5;
+  kick = { a: mul(sub(target, dv), 1 / tau), until: simT + tau };
+  minSep = r;
+  // de temps en temps, une galaxie change d'allure (les nouvelles étoiles suivent le nouveau modèle)
+  if(Math.random() < 0.3) randomLook(G[Math.random() < 0.5 ? 0 : 1]);
+}
+function onLeavingPericenter(r, d, dv){
+  const ra = rand(4.8, 7.5);
+  const a = (Math.max(minSep, 0.3) + ra) / 2;
+  const Me = effMass(r);
+  const v2 = Me * (2 / r - 1 / a);
+  if(v2 <= 0) return;
+  const target = mul(norm(dv), Math.sqrt(v2));
+  const tau = 2.0;
+  kick = { a: mul(sub(target, dv), 1 / tau), until: simT + tau };
+}
+
+function stepCores(h){
+  let [a0, a1] = coreAcc();
+  G[0].v = add(G[0].v, mul(a0, h/2)); G[1].v = add(G[1].v, mul(a1, h/2));
+  G[0].x = add(G[0].x, mul(G[0].v, h)); G[1].x = add(G[1].x, mul(G[1].v, h));
+  simT += h;
+  const res = coreAcc();
+  G[0].v = add(G[0].v, mul(res[0], h/2)); G[1].v = add(G[1].v, mul(res[1], h/2));
+
+  const d = sub(G[1].x, G[0].x), dv = sub(G[1].v, G[0].v);
+  const r = len(d), vr = dot(d, dv) / r;
+  if(r < minSep) minSep = r;
+  if(simT >= kick.until){
+    if(prevVr > 0 && vr <= 0 && r > 2.2) onApocenter(r, d, dv);
+    else if(vr > 0 && prevR < 3.2 && r >= 3.2) onLeavingPericenter(r, d, dv);
+    else if(r > 10.5 && vr > 0) kick = { a: mul(norm(d), -0.06), until: simT + 1.0 };
+  }
+  prevVr = vr; prevR = r;
+
+  // dérive lente et aléatoire de l'orientation des disques
+  for(const g of G){
+    g.w = add(mul(g.w, 1 - 0.05*h), mul([gaussR(), gaussR(), gaussR()], 0.004 * Math.sqrt(h)));
+    const wl = len(g.w);
+    if(wl > 1e-6){ g.n = norm(rotAxis(g.n, mul(g.w, 1/wl), wl * h)); }
+    [g.e1, g.e2] = perpBasis(g.n, g.e1);
+    const rp = 0.6 * g.Rmax;
+    g.phase += 0.5 * vcircJS(g, rp) / rp * h;
+  }
+  return res;
+}
+
+// ---------------- WebGL ----------------
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, depth: false, powerPreference: 'high-performance', preserveDrawingBuffer: false });
+if(!gl){ document.getElementById('err').style.display = 'flex'; return; }
+const hasFloat = !!gl.getExtension('EXT_color_buffer_float');
+
+function compile(type, id){
+  const s = gl.createShader(type);
+  gl.shaderSource(s, document.getElementById(id).textContent.trim());
+  gl.compileShader(s);
+  if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(id + ': ' + gl.getShaderInfoLog(s));
+  return s;
+}
+function program(vs, fs, varyings){
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  if(varyings) gl.transformFeedbackVaryings(p, varyings, gl.INTERLEAVED_ATTRIBS);
+  gl.linkProgram(p);
+  if(!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const u = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for(let i = 0; i < n; i++){
+    const info = gl.getActiveUniform(p, i);
+    const name = info.name.replace(/\[0\]$/, '');
+    u[name] = gl.getUniformLocation(p, info.name);
+  }
+  return { p, u };
+}
+const progUpdate = program('vsUpdate', 'fsNull', ['vPos', 'vVel', 'vInfo']);
+const progStars  = program('vsStars', 'fsStars');
+const progDown   = program('vsQuad', 'fsDown');
+const progUp     = program('vsQuad', 'fsUp');
+const progComp   = program('vsQuad', 'fsComposite');
+
+// buffers de particules (ping-pong)
+const N = CFG.n;
+const STRIDE = 48;
+const init = new Float32Array(N * 12);
+for(let i = 0; i < N; i++){
+  const host = i < N * 0.55 ? 0 : 1;
+  const u = Math.random();
+  const type = u < 0.56 ? 0 : u < 0.78 ? 1 : u < 0.85 ? 2 : 3;
+  init[i*12 + 8] = host; init[i*12 + 9] = type; init[i*12 + 10] = 0;
+}
+const bufs = [gl.createBuffer(), gl.createBuffer()];
+const vaos = [gl.createVertexArray(), gl.createVertexArray()];
+const tfs = [gl.createTransformFeedback(), gl.createTransformFeedback()];
+for(let i = 0; i < 2; i++){
+  gl.bindBuffer(gl.ARRAY_BUFFER, bufs[i]);
+  gl.bufferData(gl.ARRAY_BUFFER, init, gl.DYNAMIC_COPY);
+  gl.bindVertexArray(vaos[i]);
+  for(let a = 0; a < 3; a++){
+    gl.enableVertexAttribArray(a);
+    gl.vertexAttribPointer(a, 4, gl.FLOAT, false, STRIDE, a * 16);
+  }
+}
+gl.bindVertexArray(null);
+gl.bindBuffer(gl.ARRAY_BUFFER, null);
+for(let i = 0; i < 2; i++){
+  gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, tfs[i]);
+  gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, bufs[1 - i]);
+}
+gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null);
+let cur = 0;
+const emptyVao = gl.createVertexArray();
+
+// cibles de rendu
+function makeTarget(w, h){
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, hasFloat ? gl.RGBA16F : gl.RGBA8, w, h, 0, gl.RGBA, hasFloat ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  return { tex, fb, w, h };
+}
+let scene = null, levels = [];
+function freeTarget(t){ gl.deleteTexture(t.tex); gl.deleteFramebuffer(t.fb); }
+function resize(){
+  const dpr = window.devicePixelRatio || 1;
+  const W = innerWidth * dpr, H = innerHeight * dpr;
+  const s = CFG.q > 0 ? CFG.q : Math.min(1, Math.sqrt(9.0e6 / (W * H)));
+  canvas.width = Math.max(2, Math.round(W * s));
+  canvas.height = Math.max(2, Math.round(H * s));
+  if(scene) freeTarget(scene);
+  levels.forEach(freeTarget);
+  scene = makeTarget(canvas.width, canvas.height);
+  levels = [];
+  let w = canvas.width, h = canvas.height;
+  for(let i = 0; i < 6; i++){
+    w = Math.max(1, w >> 1); h = Math.max(1, h >> 1);
+    levels.push(makeTarget(w, h));
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+addEventListener('resize', resize);
+resize();
+
+// ---------------- caméra ----------------
+const wanderEl = makeWander(), wanderAz = makeWander(), wanderZoom = makeWander();
+const cam = { target: null, dist: null, L: null, e1: null, az: rand(0, 6.283), pos: [0,0,20], R: [1,0,0], U: [0,1,0], F: [0,0,-1] };
+let realT = 0;
+
+function updateCamera(dtReal){
+  const d = sub(G[1].x, G[0].x), dv = sub(G[1].v, G[0].v);
+  const mid = mul(add(G[0].x, G[1].x), 0.5);
+  const L = norm(cross(d, dv));
+  const kT = 1 - Math.exp(-dtReal / 1.5), kL = 1 - Math.exp(-dtReal / 8), kD = 1 - Math.exp(-dtReal / 3.5);
+  if(!cam.target){ cam.target = mid; cam.L = L; [cam.e1] = perpBasis(L); }
+  cam.target = add(cam.target, mul(sub(mid, cam.target), kT));
+  const Ln = add(cam.L, mul(sub(L, cam.L), kL));
+  if(len(Ln) > 1e-3) cam.L = norm(Ln);
+  const [e1, e2] = perpBasis(cam.L, cam.e1); cam.e1 = e1;
+
+  cam.az += dtReal * 0.035 * wanderAz(realT);
+  const el = (42 + 30 * wanderEl(realT)) * Math.PI / 180;
+  const dir = norm(add(mul(add(mul(e1, Math.cos(cam.az)), mul(e2, Math.sin(cam.az))), Math.cos(el)), mul(cam.L, Math.sin(el))));
+
+  // repère de la caméra
+  const F = mul(dir, -1);
+  let R = cross(F, cam.L); if(len(R) < 1e-3) R = cross(F, e1);
+  R = norm(R); const U = cross(R, F);
+
+  // cadrage : garder les deux galaxies à l'écran
+  const tanY = Math.tan(CFG.fov * Math.PI / 360), tanX = tanY * canvas.width / canvas.height;
+  const margin = 2.0 + 0.3 * wanderZoom(realT);
+  const hw = Math.abs(dot(d, R)) / 2 + margin, hh = Math.abs(dot(d, U)) / 2 + margin;
+  const want = Math.min(34, Math.max(5.5, Math.max(hw / tanX, hh / tanY)));
+  cam.dist = cam.dist === null ? want : cam.dist + (want - cam.dist) * kD;
+  cam.pos = add(cam.target, mul(dir, cam.dist));
+  cam.R = R; cam.U = U; cam.F = F; cam.tanX = tanX; cam.tanY = tanY;
+}
+function viewProj(){
+  const { R, U, F, pos } = cam;
+  const near = 0.05, far = 200, f = 1 / cam.tanY, aspect = canvas.width / canvas.height;
+  const V = [R[0], U[0], -F[0], 0,  R[1], U[1], -F[1], 0,  R[2], U[2], -F[2], 0,
+             -dot(R, pos), -dot(U, pos), dot(F, pos), 1];
+  const Pm = [f/aspect,0,0,0, 0,f,0,0, 0,0,(far+near)/(near-far),-1, 0,0,2*far*near/(near-far),0];
+  const out = new Float32Array(16);
+  for(let c = 0; c < 4; c++) for(let r = 0; r < 4; r++){
+    let s = 0; for(let k = 0; k < 4; k++) s += Pm[k*4 + r] * V[c*4 + k];
+    out[c*4 + r] = s;
+  }
+  return out;
+}
+
+// ---------------- boucle ----------------
+function setGalaxyUniforms(u, mid){
+  const f3 = (key, fn) => gl.uniform3fv(u[key], new Float32Array([...fn(G[0]), ...fn(G[1])]));
+  const f4 = (key, fn) => gl.uniform4fv(u[key], new Float32Array([...fn(G[0]), ...fn(G[1])]));
+  gl.uniform3fv(u.uCore, new Float32Array([...mid[0], ...mid[1]]));
+  f3('uCoreVel', g => g.v);
+  f4('uMass', g => [g.Mc, g.ac, g.Mh, g.ah]);
+  f3('uN', g => g.n); f3('uE1', g => g.e1); f3('uE2', g => g.e2);
+  f4('uGal0', g => [g.Rd, g.Rmax, g.tanPitch, g.arms]);
+  f4('uGal1', g => [g.phase, g.thick, g.bulge, 0]);
+}
+
+function simulate(simDt){
+  const nsub = Math.max(1, Math.ceil(simDt / 0.02));
+  const h = simDt / nsub;
+  gl.useProgram(progUpdate.p);
+  gl.enable(gl.RASTERIZER_DISCARD);
+  for(let s = 0; s < nsub; s++){
+    const x0 = [G[0].x, G[1].x];
+    const res = stepCores(h);
+    const mid = [mul(add(x0[0], G[0].x), 0.5), mul(add(x0[1], G[1].x), 0.5)];
+    const u = progUpdate.u;
+    setGalaxyUniforms(u, mid);
+    gl.uniform3fv(u.uKick, new Float32Array([...res[2], ...res[3]]));
+    gl.uniform1f(u.uDt, h);
+    gl.uniform1f(u.uTime, simT % 100000);
+    gl.bindVertexArray(vaos[cur]);
+    gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, tfs[cur]);
+    gl.beginTransformFeedback(gl.POINTS);
+    gl.drawArrays(gl.POINTS, 0, N);
+    gl.endTransformFeedback();
+    gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null);
+    cur = 1 - cur;
+  }
+  gl.disable(gl.RASTERIZER_DISCARD);
+  gl.bindVertexArray(null);
+}
+
+let frameNo = 0;
+let imagesDepuisHalo = 99;
+function render(){
+  // étoiles → scène HDR
+  gl.bindFramebuffer(gl.FRAMEBUFFER, scene.fb);
+  gl.viewport(0, 0, scene.w, scene.h);
+  gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  gl.useProgram(progStars.p);
+  const u = progStars.u;
+  gl.uniformMatrix4fv(u.uVP, false, viewProj());
+  gl.uniform1f(u.uPixScale, scene.h / (2 * cam.tanY));
+  gl.uniform1f(u.uBright, CFG.bright * 0.155 * (160000 / N) * (hasFloat ? 1 : 0.35));
+  const f3 = (key, fn) => gl.uniform3fv(u[key], new Float32Array([...fn(G[0]), ...fn(G[1])]));
+  f3('uTintOld', g => g.tintOld); f3('uTintYoung', g => g.tintYoung); f3('uTintGas', g => g.tintGas);
+  gl.bindVertexArray(vaos[cur]);
+  gl.drawArrays(gl.POINTS, 0, N);
+  gl.bindVertexArray(emptyVao);
+
+  // Halo (dual Kawase) : recalculé une image sur deux par défaut. Il évolue
+  // lentement, et ses douze passes coûtent cher ; entre-temps on réutilise
+  // simplement la texture précédente.
+  gl.disable(gl.BLEND);
+  if(++imagesDepuisHalo >= CFG.bloomEvery){
+  imagesDepuisHalo = 0;
+  gl.useProgram(progDown.p);
+  let src = scene;
+  for(const L of levels){
+    gl.bindFramebuffer(gl.FRAMEBUFFER, L.fb); gl.viewport(0, 0, L.w, L.h);
+    gl.bindTexture(gl.TEXTURE_2D, src.tex);
+    gl.uniform1i(progDown.u.uTex, 0);
+    gl.uniform2f(progDown.u.uTexel, 1 / src.w, 1 / src.h);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    src = L;
+  }
+  gl.useProgram(progUp.p);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  for(let i = levels.length - 1; i > 0; i--){
+    const from = levels[i], to = levels[i - 1];
+    gl.bindFramebuffer(gl.FRAMEBUFFER, to.fb); gl.viewport(0, 0, to.w, to.h);
+    gl.bindTexture(gl.TEXTURE_2D, from.tex);
+    gl.uniform1i(progUp.u.uTex, 0);
+    gl.uniform2f(progUp.u.uTexel, 0.5 / from.w, 0.5 / from.h);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+  gl.disable(gl.BLEND);
+  }
+
+  // composition finale
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.useProgram(progComp.p);
+  const c = progComp.u;
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, scene.tex);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, levels[0].tex);
+  gl.uniform1i(c.uScene, 0); gl.uniform1i(c.uBloom, 1);
+  gl.uniform3fv(c.uCamR, cam.R); gl.uniform3fv(c.uCamU, cam.U); gl.uniform3fv(c.uCamF, cam.F);
+  gl.uniform2f(c.uTan, cam.tanX, cam.tanY);
+  gl.uniform1f(c.uPix, 2 * cam.tanY / canvas.height);
+  gl.uniform1f(c.uExposure, 1.0);
+  gl.uniform1f(c.uBloomAmt, 0.08);
+  gl.uniform1f(c.uFrame, frameNo++ % 1000);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.activeTexture(gl.TEXTURE0);
+}
+
+let imagesDepuisSimulation = 0, dtAccumule = 0;
+function tick(realDt){
+  realDt = Math.min(realDt, 0.1);
+  realT += realDt;
+  // La physique tourne à cadence réduite (30 Hz par défaut) : à cette vitesse
+  // les étoiles se déplacent de façon indiscernable, et c'est autant de temps
+  // GPU rendu — la simulation de 240 000 corps est le plus gros poste.
+  dtAccumule += realDt;
+  if(++imagesDepuisSimulation >= CFG.sim){
+    simulate(dtAccumule * TIME_SCALE * CFG.speed);
+    imagesDepuisSimulation = 0; dtAccumule = 0;
+  }
+  fondreTeintes(G[0], realDt); fondreTeintes(G[1], realDt);
+  updateCamera(realDt);
+  render();
+}
+
+// hooks pour tests
+window.__advance = (seconds, step = 0.1) => {
+  for(let t = 0; t < seconds; t += step){
+    realT += step;
+    simulate(step * TIME_SCALE * CFG.speed);
+    updateCamera(step);
+  }
+  render(); gl.finish();
+};
+window.__state = () => {
+  const M = viewProj();
+  const proj = x => { const c = [0,1,2,3].map(r => M[r]*x[0] + M[4+r]*x[1] + M[8+r]*x[2] + M[12+r]); return [+(c[0]/c[3]).toFixed(2), +(c[1]/c[3]).toFixed(2)]; };
+  return { simT: +simT.toFixed(2), sep: +len(sub(G[1].x, G[0].x)).toFixed(2), camDist: +cam.dist.toFixed(2), s0: proj(G[0].x), s1: proj(G[1].x), tgt: proj(cam.target) };
+};
+
+window.__coresOnly = (seconds) => {
+  const ev = []; let pr = null, pvr = 0; const h = 0.02;
+  for(let t = 0; t < seconds * TIME_SCALE * CFG.speed; t += h){
+    stepCores(h);
+    const d = sub(G[1].x, G[0].x), dv = sub(G[1].v, G[0].v), r = len(d), vr = dot(d, dv) / r;
+    if(pr !== null && pvr < 0 && vr >= 0) ev.push(['peri', +(simT / TIME_SCALE).toFixed(0), +r.toFixed(2)]);
+    if(pr !== null && pvr > 0 && vr <= 0) ev.push(['apo', +(simT / TIME_SCALE).toFixed(0), +r.toFixed(2)]);
+    pr = r; pvr = vr;
+  }
+  const com = add(mul(G[0].x, G[0].M / Mt), mul(G[1].x, G[1].M / Mt));
+  return { ev, com: com.map(x => +x.toFixed(2)) };
+};
+// warm-up : répartit les âges et installe la caméra
+simulate(0.02); updateCamera(0.016);
+
+let last = performance.now(), lastDraw = 0;
+function frame(now){
+  requestAnimationFrame(frame);
+  if(now - lastDraw < 1000 / CFG.fps - 2) return;
+  const dt = (now - last) / 1000; last = now; lastDraw = now;
+  tick(dt);
+}
+if(!QS.has('test')) requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

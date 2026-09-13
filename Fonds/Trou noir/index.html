@@ -1,0 +1,578 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Trou noir — fond d'écran animé</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden}
+  canvas{position:fixed;inset:0;width:100vw;height:100vh;display:block}
+  #err{position:fixed;inset:0;display:none;align-items:center;justify-content:center;color:#888;font:14px -apple-system,sans-serif}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="err">WebGL indisponible</div>
+
+<script id="vs" type="x-shader/x-vertex">
+attribute vec2 aPos;
+void main(){ gl_Position = vec4(aPos, 0.0, 1.0); }
+</script>
+
+<script id="fs" type="x-shader/x-fragment">
+precision highp float;
+
+uniform vec2  uRes;
+uniform float uTime;        // temps du disque (modulo)
+uniform vec3  uCamPos, uCamFwd, uCamRight, uCamUp;
+uniform float uTanFov;
+uniform float uPix;         // taille angulaire d'un pixel
+uniform vec3  uStarPos;     // étoile en orbite
+uniform vec3  uPlanetPos;   // planète en orbite
+uniform float uSpin;
+uniform float uExposure;
+uniform float uSteps;       // pas de calcul réellement parcourus
+uniform float uDtK;         // finesse du pas (petit = plus fin, plus lent)
+uniform sampler2D uNebuleuse;  // ciel pré-calculé (nébuleuses, voie lactée)
+
+#define STEPS 512          // plafond ; le nombre réel vient de uSteps
+const float RIN   = 3.0;    // ISCO (Rs = 1)
+const float ROUT  = 15.0;
+const float STAR_R   = 0.32;
+const float PLANET_R = 0.42;
+
+// ---------- bruit ----------
+float hash13(vec3 p3){
+  p3 = fract(p3 * 0.1031);
+  p3 += dot(p3, p3.zyx + 31.32);
+  return fract((p3.x + p3.y) * p3.z);
+}
+vec3 hash33(vec3 p3){
+  p3 = fract(p3 * vec3(0.1031, 0.1030, 0.0973));
+  p3 += dot(p3, p3.yxz + 33.33);
+  return fract((p3.xxy + p3.yxx) * p3.zyx);
+}
+float vnoise(vec3 p){
+  vec3 i = floor(p), f = fract(p);
+  vec3 u = f*f*(3.0 - 2.0*f);
+  float a = hash13(i),               b = hash13(i + vec3(1,0,0));
+  float c = hash13(i + vec3(0,1,0)), d = hash13(i + vec3(1,1,0));
+  float e = hash13(i + vec3(0,0,1)), f1 = hash13(i + vec3(1,0,1));
+  float g = hash13(i + vec3(0,1,1)), h = hash13(i + vec3(1,1,1));
+  return mix(mix(mix(a,b,u.x), mix(c,d,u.x), u.y),
+             mix(mix(e,f1,u.x), mix(g,h,u.x), u.y), u.z);
+}
+float fbm(vec3 p){
+  float s = 0.0, a = 0.5;
+  for(int i = 0; i < 5; i++){
+    s += a * vnoise(p);
+    p = p * 2.03 + vec3(1.7, 9.2, 3.1);
+    a *= 0.5;
+  }
+  return s;
+}
+
+// fbm anisotrope pour le disque : le détail radial monte moins vite (évite le moiré)
+float fbmDisk(vec3 p){
+  float s = 0.0, a = 0.5;
+  for(int i = 0; i < 5; i++){
+    s += a * vnoise(p);
+    p = p * vec3(2.2, 2.2, 1.6) + vec3(1.7, 9.2, 3.1);
+    a *= 0.5;
+  }
+  return s / 0.96875;
+}
+
+// ---------- ciel (étoiles + voie lactée) ----------
+vec3 starLayer(vec3 d, float scale, float density, float seed){
+  vec3 p = d * scale;
+  vec3 id = floor(p);
+  vec3 h = hash33(id + seed);
+  if(h.x > density) return vec3(0.0);
+  vec3 sp = normalize(id + 0.2 + 0.6 * hash33(id * 1.7 + seed + 3.1));
+  float dist = length(d - sp);
+  float w = uPix * 0.9;
+  float mag = pow(hash13(id + seed + 7.7), 8.0) * 5.0 + 0.12;
+  vec3 tint = mix(vec3(1.0, 0.78, 0.58), vec3(0.72, 0.82, 1.0), h.z);
+  float core = exp(-dist*dist / (w*w));
+  float glare = mag > 2.5 ? 0.012 * w*w / (dist*dist + w*w*0.5) * mag : 0.0;
+  return tint * (core * mag + glare);
+}
+
+// Direction → coordonnées de la texture panoramique du ciel.
+vec2 directionVersUV(vec3 d){
+  return vec2(atan(d.z, d.x) * 0.15915494 + 0.5,
+              acos(clamp(d.y, -1.0, 1.0)) * 0.31830989);
+}
+
+vec3 sky(vec3 d){
+  // Les nébuleuses et la voie lactée ne dépendent que de la direction du rayon
+  // et ne changent jamais : elles sont calculées une seule fois au démarrage
+  // dans une texture panoramique. Les recalculer à chaque pixel et à chaque
+  // image représentait près d'un quart du temps de rendu.
+  // (Stockées en racine carrée : le format 8 bits garderait sinon mal les
+  // nuances très sombres du fond de ciel.)
+  vec3 c = texture2D(uNebuleuse, directionVersUV(d)).rgb;
+  vec3 col = c * c;
+
+  // Les étoiles, elles, restent procédurales : elles doivent rester piquées,
+  // et elles coûtent peu.
+  float lat = dot(d, normalize(vec3(0.38, 1.0, 0.12)));
+  float band = exp(-lat*lat * 9.0);
+  col += starLayer(d,  60.0, 0.115, 0.0);
+  col += starLayer(d, 140.0, 0.050, 11.0) * 0.45;
+  col += starLayer(d, 280.0, 0.020, 23.0) * (0.15 + band * 0.9);
+  col += starLayer(d, 540.0, 0.009, 37.0) * (0.10 + band * 0.75);   // poussière d'étoiles
+  return col;
+}
+
+// ---------- disque d'accrétion ----------
+vec3 bbColor(float t){
+  vec3 c = vec3(1.0, 0.28, 0.05);
+  c = mix(c, vec3(1.0, 0.55, 0.18), smoothstep(0.15, 0.50, t));
+  c = mix(c, vec3(1.0, 0.82, 0.58), smoothstep(0.50, 0.90, t));
+  c = mix(c, vec3(0.92, 0.95, 1.00), smoothstep(0.90, 1.30, t));
+  c = mix(c, vec3(0.70, 0.80, 1.00), smoothstep(1.30, 2.00, t));
+  return c;
+}
+
+vec4 diskSample(vec3 p, vec3 rd){
+  float r = length(p.xz);
+  if(r < RIN * 0.85 || r > ROUT) return vec4(0.0);
+
+  float phi = atan(p.z, p.x);
+  // Rotation képlérienne (ω ∝ r^-1.5). Pour éviter que la rotation différentielle
+  // n'enroule la texture à l'infini, on fond deux couches décalées d'un demi-cycle.
+  float omega = uSpin * 2.4 * pow(r, -1.5);
+  const float P = 16.0;
+  vec3 nA = vec3(0.0), nB = vec3(0.0);
+  float wA = 0.0, wB = 0.0;
+  for(int k = 0; k < 2; k++){
+    float cyc = uTime / P + float(k) * 0.5;
+    float ph = fract(cyc);
+    float seed = mod(floor(cyc), 60.0);
+    float w = 1.0 - abs(2.0 * ph - 1.0);
+    float a = phi - omega * (ph - 0.5) * P;
+    vec3 q = vec3(cos(a) * 1.8, sin(a) * 1.8, r * 0.45) + vec3(seed * 1.37, seed * 2.71, seed * 3.93);
+    vec3 qs = vec3(cos(a) * 3.2, sin(a) * 3.2, r * 1.5) + seed;
+    vec3 n = vec3(fbmDisk(q), fbmDisk(q * vec3(2.0, 2.0, 1.7) + 4.0),
+                  0.55 * vnoise(qs) + 0.30 * vnoise(qs * vec3(2.1, 2.1, 1.7) + 5.3)
+                  + 0.15 * vnoise(qs * vec3(4.3, 4.3, 3.1) + 8.9));
+    if(k == 0){ nA = n; wA = w; } else { nB = n; wB = w; }
+  }
+  // mélange qui préserve le contraste
+  vec3 nm = (wA * (nA - 0.5) + wB * (nB - 0.5)) / sqrt(wA*wA + wB*wB + 1e-4) + 0.5;
+  float n1 = nm.x, n2 = clamp(nm.y, 0.0, 1.0), n3 = clamp(nm.z, 0.0, 1.0);
+  float dens = 0.12 + 1.25 * smoothstep(0.35, 0.78, n1) * (0.25 + 1.1 * n2 * n2);
+  dens *= 0.85 + 0.2 * sin(r * 1.6 + n1 * 5.0);         // anneaux
+  dens *= 0.55 + 0.9 * smoothstep(0.25, 0.75, n3);       // fines stries
+  dens *= smoothstep(RIN * 0.85, RIN * 1.2, r) * (1.0 - smoothstep(ROUT * 0.3, ROUT, r));
+
+  // profil de température (Shakura–Sunyaev)
+  float x = RIN * 0.9 / r;
+  float T = pow(x, 0.75) * pow(max(1.0 - sqrt(min(x, 1.0)), 0.0), 0.25) / 0.488;
+
+  // effet Doppler relativiste + décalage gravitationnel
+  vec3 tang = normalize(vec3(-p.z, 0.0, p.x));
+  float beta = sqrt(0.5 / max(r - 1.0, 0.5));
+  beta = min(beta, 0.7);
+  float gam = 1.0 / sqrt(1.0 - beta*beta);
+  float dop = 1.0 / (gam * (1.0 + beta * dot(tang, rd)));
+  float g = dop * sqrt(1.0 - 1.0 / r);
+  g = mix(1.0, g, 0.9);
+
+  float Tobs = T * g * 0.68;
+  float I = 4.2 * pow(T, 3.6) * pow(g, 3.4);
+  vec3 col = bbColor(Tobs) * I * dens;
+  float alpha = clamp(dens * 0.85, 0.0, 0.95);
+  return vec4(col, alpha);
+}
+
+// ---------- corps en orbite ----------
+// renvoie t d'entrée dans [0,1] ou -1
+float segSphere(vec3 p0, vec3 p1, vec3 c, float R){
+  vec3 d = p1 - p0;
+  vec3 m = p0 - c;
+  float A = dot(d, d);
+  float B = dot(m, d);
+  float C = dot(m, m) - R*R;
+  if(C < 0.0) return 0.0;
+  float disc = B*B - A*C;
+  if(disc < 0.0) return -1.0;
+  float t = (-B - sqrt(disc)) / A;
+  return (t >= 0.0 && t <= 1.0) ? t : -1.0;
+}
+float segDist(vec3 p0, vec3 p1, vec3 c){
+  vec3 d = p1 - p0;
+  float t = clamp(dot(c - p0, d) / dot(d, d), 0.0, 1.0);
+  return length(p0 + d*t - c);
+}
+
+vec3 starShade(vec3 hp, vec3 rd){
+  vec3 n = normalize(hp - uStarPos);
+  float mu = max(dot(n, -rd), 0.0);
+  float gran = fbm(n * 9.0 + uTime * 0.3);
+  return vec3(0.75, 0.86, 1.0) * 9.0 * (0.35 + 0.65 * mu) * (0.8 + 0.4 * gran);
+}
+vec3 planetShade(vec3 hp, vec3 rd){
+  vec3 n = normalize(hp - uPlanetPos);
+  vec3 L = normalize(-hp);                       // éclairée par le disque
+  vec3 Ls = normalize(uStarPos - hp);            // et un peu par l'étoile
+  float bands = fbm(vec3(n.y * 7.0, n.x * 1.5 + uTime * 0.05, n.z * 1.5));
+  vec3 alb = mix(vec3(0.55, 0.36, 0.25), vec3(0.85, 0.7, 0.55), bands);
+  float dif = max(dot(n, L), 0.0);
+  float difS = max(dot(n, Ls), 0.0) * 0.25;
+  float rim = pow(1.0 - max(dot(n, -rd), 0.0), 3.0);
+  vec3 col = alb * (dif * vec3(1.6, 1.05, 0.65) + difS * vec3(0.7, 0.8, 1.0) + 0.015);
+  col += vec3(0.9, 0.55, 0.3) * rim * dif * 0.8;
+  return col;
+}
+
+float erfA(float x){
+  float x2 = x*x;
+  const float k = 0.147;
+  float t = sqrt(1.0 - exp(-x2 * (1.27324 + k*x2) / (1.0 + k*x2)));
+  return x < 0.0 ? -t : t;
+}
+
+// ---------- tone mapping ----------
+vec3 aces(vec3 x){
+  const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+  return clamp((x*(a*x + b)) / (x*(c*x + d) + e), 0.0, 1.0);
+}
+
+void main(){
+  vec2 uv = (gl_FragCoord.xy - 0.5 * uRes) / (0.5 * uRes.y);
+  vec3 rd = normalize(uCamFwd + (uv.x * uCamRight + uv.y * uCamUp) * uTanFov);
+
+  vec3 pos = uCamPos;
+  vec3 vel = rd;
+  vec3 hv = cross(pos, vel);
+  float h2 = dot(hv, hv);
+
+  vec3 acc = vec3(0.0);     // lumière accumulée
+  float trans = 1.0;        // transmittance
+  vec3 glow = vec3(0.0);
+  float minStar = 1e9;
+  bool captured = false;
+  bool hitBody = false;
+
+  float r2 = dot(pos, pos);
+  vec3 accel = -1.5 * h2 * pos / (r2 * r2 * sqrt(r2));
+  // La norme de la vitesse d'un photon ne varie pas le long du trajet :
+  // on la calcule une fois au lieu d'une racine carrée à chaque pas.
+  float vitesse = length(vel);
+
+  for(int i = 0; i < STEPS; i++){
+    if(float(i) >= uSteps) break;
+    float r = sqrt(r2);
+    float dt = clamp(uDtK * r, 0.022, 2.4);
+
+    // kick-drift-kick
+    vel += accel * (0.5 * dt);
+    vec3 np = pos + vel * dt;
+    float nr2 = dot(np, np);
+    vec3 naccel = -1.5 * h2 * np / (nr2 * nr2 * sqrt(nr2));
+    vel += naccel * (0.5 * dt);
+
+    vec3 dir = vel;   // normalisé seulement si nécessaire
+    float segL = dt * vitesse;
+
+    // Corps en orbite : tests de proximité au carré, pour éviter deux racines
+    // carrées par pas alors que la quasi-totalité des rayons passe loin d'eux.
+    float ts = -1.0, tp = -1.0;
+    vec3 versEtoile = pos - uStarPos;
+    float seuilE = segL + 5.0;
+    if(dot(versEtoile, versEtoile) < seuilE * seuilE){
+      ts = segSphere(pos, np, uStarPos, STAR_R);
+      minStar = min(minStar, segDist(pos, np, uStarPos));
+    }
+    vec3 versPlanete = pos - uPlanetPos;
+    float seuilP = segL + PLANET_R;
+    if(dot(versPlanete, versPlanete) < seuilP * seuilP) tp = segSphere(pos, np, uPlanetPos, PLANET_R);
+
+    // traversée du plan du disque
+    float tdisk = -1.0;
+    if(pos.y * np.y < 0.0) tdisk = pos.y / (pos.y - np.y);
+
+    // ordre : ce qui est touché en premier le long du segment
+    float tBody = -1.0; int which = 0;
+    if(ts >= 0.0){ tBody = ts; which = 1; }
+    if(tp >= 0.0 && (tBody < 0.0 || tp < tBody)){ tBody = tp; which = 2; }
+
+    if(tdisk >= 0.0 && (tBody < 0.0 || tdisk < tBody)){
+      vec4 ds = diskSample(mix(pos, np, tdisk), normalize(dir));
+      acc += trans * ds.rgb;
+      trans *= 1.0 - ds.a;
+    }
+    if(tBody >= 0.0){
+      vec3 hp = mix(pos, np, tBody);
+      vec3 nd = normalize(dir);
+      vec3 bc = (which == 1) ? starShade(hp, nd) : planetShade(hp, nd);
+      acc += trans * bc;
+      trans = 0.0;
+      hitBody = true;
+    }
+
+    // halo volumétrique autour du disque
+    // intégrale analytique de la gaussienne verticale sur le segment (pas de moiré)
+    vec3 mid = 0.5 * (pos + np);
+    float rr2 = dot(mid.xz, mid.xz);
+    // Le halo n'apporte quelque chose que près du plan du disque et pas trop loin
+    // du centre. Deux comparaisons au carré évitent la racine et surtout les deux
+    // fonctions d'erreur (chacune une exponentielle) sur la majorité des pas.
+    float yMin = min(abs(pos.y), abs(np.y));
+    if(rr2 < (ROUT + 4.0) * (ROUT + 4.0) && (pos.y * np.y < 0.0 || yMin < 3.5)){
+      float rr = sqrt(rr2);
+      float hgt = 0.18 + 0.05 * rr;
+      float y0 = pos.y / hgt, y1 = np.y / hgt;
+      float dy = y1 - y0;
+      float gy = abs(dy) > 1e-3
+        ? 0.886227 * (erfA(y1) - erfA(y0)) / dy
+        : exp(-y0*y0);
+      float prof = smoothstep(2.3, 3.6, rr) * exp(-(rr - 3.6) * 0.28);
+      glow += trans * gy * segL * prof * vec3(1.0, 0.45, 0.15) * 0.045;
+    }
+
+    pos = np; r2 = nr2; accel = naccel;
+
+    if(hitBody || trans < 0.01) break;
+    if(r2 < 1.0){ captured = true; break; }
+    if(r2 > 3600.0 && dot(pos, vel) > 0.0) break;
+  }
+
+  vec3 col = acc + glow;
+  if(!captured && !hitBody) col += trans * sky(normalize(vel));
+
+  // halo de l'étoile (inclut ses images lentillées)
+  col += vec3(0.6, 0.75, 1.0) * 0.5 * pow(STAR_R / max(minStar, STAR_R), 2.2);
+
+  col *= uExposure;
+  col = aces(col);
+  // vignettage léger
+  vec2 q = gl_FragCoord.xy / uRes;
+  col *= 0.55 + 0.45 * pow(16.0 * q.x * q.y * (1.0 - q.x) * (1.0 - q.y), 0.22);
+  col = pow(col, vec3(1.0 / 2.2));
+  col += (hash13(vec3(gl_FragCoord.xy, uTime)) - 0.5) / 255.0;   // dithering
+  gl_FragColor = vec4(col, 1.0);
+}
+</script>
+
+<script id="fsNebuleuse" type="x-shader/x-fragment">
+// Peint une fois pour toutes les nébuleuses et la voie lactée dans une texture
+// panoramique (projection équirectangulaire). Le code est celui de l'ancien
+// sky(), étoiles exclues ; il ne tourne qu'au démarrage.
+precision highp float;
+uniform vec2 uTaille;
+
+float hash13(vec3 p3){
+  p3 = fract(p3 * 0.1031);
+  p3 += dot(p3, p3.zyx + 31.32);
+  return fract((p3.x + p3.y) * p3.z);
+}
+float vnoise(vec3 p){
+  vec3 i = floor(p), f = fract(p);
+  vec3 u = f*f*(3.0 - 2.0*f);
+  float a = hash13(i),               b = hash13(i + vec3(1,0,0));
+  float c = hash13(i + vec3(0,1,0)), d = hash13(i + vec3(1,1,0));
+  float e = hash13(i + vec3(0,0,1)), f1 = hash13(i + vec3(1,0,1));
+  float g = hash13(i + vec3(0,1,1)), h = hash13(i + vec3(1,1,1));
+  return mix(mix(mix(a,b,u.x), mix(c,d,u.x), u.y),
+             mix(mix(e,f1,u.x), mix(g,h,u.x), u.y), u.z);
+}
+float fbm(vec3 p){
+  float s = 0.0, a = 0.5;
+  for(int i = 0; i < 5; i++){
+    s += a * vnoise(p);
+    p = p * 2.03 + vec3(1.7, 9.2, 3.1);
+    a *= 0.5;
+  }
+  return s;
+}
+
+void main(){
+  vec2 uv = gl_FragCoord.xy / uTaille;
+  float phi = (uv.x - 0.5) * 6.28318531;
+  float theta = uv.y * 3.14159265;
+  float st = sin(theta);
+  vec3 d = vec3(st * cos(phi), cos(theta), st * sin(phi));
+
+  vec3 n = normalize(vec3(0.38, 1.0, 0.12));   // pôle galactique
+  float lat = dot(d, n);
+  float band = exp(-lat*lat * 9.0);
+  float core = exp(-lat*lat * 40.0);
+  float f  = fbm(d * 2.6 + 1.3);
+  float f2 = fbm(d * 6.5 - 2.1);
+  float dust = smoothstep(0.45, 0.75, fbm(d * 4.2 + 7.0));
+  vec3 neb = mix(vec3(0.03, 0.02, 0.07), vec3(0.16, 0.08, 0.20), f);
+  neb = mix(neb, vec3(0.30, 0.22, 0.20), core * f2);
+  vec3 col = neb * band * (0.08 + 0.9 * f2 * f * f) * (1.0 - 0.8 * dust * band);
+  col *= 0.80 + 0.40 * vnoise(d * 14.0 + 5.5);
+  col += vec3(0.002, 0.003, 0.007);            // fond bleuté très léger
+
+  gl_FragColor = vec4(sqrt(max(col, 0.0)), 1.0);
+}
+</script>
+
+<script>
+(function(){
+  // Paramètres modifiables via l'URL (?fps=60&q=1&spin=1.5&dist=24&fov=38&x=0&y=0&cam=0)
+  const P = new URLSearchParams(location.search);
+  const num = (k, d) => (P.has(k) && !isNaN(+P.get(k))) ? +P.get(k) : d;
+  const cfg = {
+    fps:  num('fps', 30),
+    q:    num('q', 0),          // 0 = auto
+    spin: num('spin', 1),
+    dist: num('dist', 40),
+    fov:  num('fov', 26),       // champ vertical en degrés
+    elev: num('elev', 11),       // hauteur de la caméra au-dessus du disque (°)
+    orbit: num('cam', 1),       // 1 = la caméra tourne lentement autour
+    exposure: num('exp', 1.0),
+    steps: num('steps', 300),   // qualité du lentillage
+    dtk:  num('dtk', 0.07),     // finesse d'intégration
+  };
+
+  const canvas = document.getElementById('c');
+  const gl = canvas.getContext('webgl', { antialias: false, alpha: false, powerPreference: 'high-performance' });
+  if(!gl){ document.getElementById('err').style.display = 'flex'; return; }
+
+  function sh(type, src){
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  }
+  const prog = gl.createProgram();
+  gl.attachShader(prog, sh(gl.VERTEX_SHADER, document.getElementById('vs').textContent));
+  gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, document.getElementById('fs').textContent));
+  gl.linkProgram(prog);
+  if(!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(prog, 'aPos');
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+  const U = {};
+  ['uRes','uTime','uCamPos','uCamFwd','uCamRight','uCamUp','uTanFov','uPix','uStarPos','uPlanetPos','uSpin','uExposure','uSteps','uDtK']
+    .forEach(n => U[n] = gl.getUniformLocation(prog, n));
+
+  // ---- Ciel pré-calculé ---------------------------------------------------
+  // Les nébuleuses sont peintes une seule fois dans une texture panoramique de
+  // 2048×1024, puis simplement lues par le nuanceur principal.
+  const LARGEUR_CIEL = 2048, HAUTEUR_CIEL = 1024;
+  const texCiel = gl.createTexture();
+  (function peindreLeCiel(){
+    const progCiel = gl.createProgram();
+    gl.attachShader(progCiel, sh(gl.VERTEX_SHADER, document.getElementById('vs').textContent));
+    gl.attachShader(progCiel, sh(gl.FRAGMENT_SHADER, document.getElementById('fsNebuleuse').textContent));
+    gl.linkProgram(progCiel);
+    if(!gl.getProgramParameter(progCiel, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(progCiel));
+
+    gl.bindTexture(gl.TEXTURE_2D, texCiel);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, LARGEUR_CIEL, HAUTEUR_CIEL, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);        // continuité à la couture
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texCiel, 0);
+    gl.viewport(0, 0, LARGEUR_CIEL, HAUTEUR_CIEL);
+    gl.useProgram(progCiel);
+    const posCiel = gl.getAttribLocation(progCiel, 'aPos');
+    gl.enableVertexAttribArray(posCiel);
+    gl.vertexAttribPointer(posCiel, 2, gl.FLOAT, false, 0, 0);
+    gl.uniform2f(gl.getUniformLocation(progCiel, 'uTaille'), LARGEUR_CIEL, HAUTEUR_CIEL);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.deleteFramebuffer(fbo);
+    gl.deleteProgram(progCiel);
+
+    // On rend la main au programme principal.
+    gl.useProgram(prog);
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  })();
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, texCiel);
+  gl.uniform1i(gl.getUniformLocation(prog, 'uNebuleuse'), 0);
+
+  const tanFov = Math.tan(cfg.fov * Math.PI / 360);
+
+  function resize(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = innerWidth * dpr, H = innerHeight * dpr;
+    // q = 0 : pleine définition native (plafond ≈ 8 Mpx).
+    // q > 1 : suréchantillonnage — on rend plus grand et le navigateur réduit,
+    //         ce qui lisse les bords (anneau de photons, étoiles).
+    const s = cfg.q > 0 ? cfg.q : Math.min(1, Math.sqrt(8.0e6 / (W * H)));
+    canvas.width  = Math.max(1, Math.round(W * s));
+    canvas.height = Math.max(1, Math.round(H * s));
+    gl.viewport(0, 0, canvas.width, canvas.height);
+  }
+  addEventListener('resize', resize);
+  resize();
+
+  // orbite inclinée : rayon, inclinaison, longitude du nœud, période, phase
+  function orbitPos(R, inc, node, period, phase, t){
+    const th = phase + 2 * Math.PI * ((t / period) % 1);
+    let x = R * Math.cos(th), y = 0, z = R * Math.sin(th);
+    const ci = Math.cos(inc), si = Math.sin(inc);
+    [y, z] = [y * ci - z * si, y * si + z * ci];
+    const cn = Math.cos(node), sn = Math.sin(node);
+    [x, z] = [x * cn + z * sn, -x * sn + z * cn];
+    return [x, y, z];
+  }
+  const norm = v => { const l = Math.hypot(v[0], v[1], v[2]); return [v[0]/l, v[1]/l, v[2]/l]; };
+  const cross = (a, b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+
+  let last = 0;
+  function frame(nowMs){
+    requestAnimationFrame(frame);
+    if(nowMs - last < 1000 / cfg.fps - 2) return;
+    last = nowMs;
+    draw(Date.now() / 1000);   // temps absolu → continuité après rechargement
+  }
+
+  function draw(T){
+    const spin = cfg.spin;
+
+    // caméra
+    const az = cfg.orbit ? 2 * Math.PI * ((T / 1200) % 1) : 0.6;
+    const el = (cfg.elev + (cfg.orbit ? 2.0 * Math.sin(2 * Math.PI * ((T / 180) % 1)) : 0)) * Math.PI / 180;
+    const cam = [cfg.dist * Math.cos(el) * Math.cos(az), cfg.dist * Math.sin(el), cfg.dist * Math.cos(el) * Math.sin(az)];
+    const fwd = norm([-cam[0], -cam[1], -cam[2]]);
+    const right = norm(cross(fwd, [0, 1, 0]));
+    const up = cross(right, fwd);
+
+    const star   = orbitPos(8.5,  0.50, 0.9, 48 / spin, 0.0, T);
+    const planet = orbitPos(12.5, -0.24, 2.4, 85 / spin, 2.0, T);
+
+    gl.uniform2f(U.uRes, canvas.width, canvas.height);
+    gl.uniform1f(U.uTime, T % 14400);
+    gl.uniform3fv(U.uCamPos, cam);
+    gl.uniform3fv(U.uCamFwd, fwd);
+    gl.uniform3fv(U.uCamRight, right);
+    gl.uniform3fv(U.uCamUp, up);
+    gl.uniform1f(U.uTanFov, tanFov);
+    gl.uniform1f(U.uPix, 2 * tanFov / canvas.height);
+    gl.uniform3fv(U.uStarPos, star);
+    gl.uniform3fv(U.uPlanetPos, planet);
+    gl.uniform1f(U.uSpin, spin);
+    gl.uniform1f(U.uExposure, cfg.exposure);
+    gl.uniform1f(U.uSteps, cfg.steps);
+    gl.uniform1f(U.uDtK, cfg.dtk);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+  window.__draw = (t) => { draw(t); gl.finish(); };
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,704 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ciel étoilé — fond d'écran animé</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden}
+  canvas{position:fixed;inset:0;width:100vw;height:100vh;display:block}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<script>
+(function(){
+'use strict';
+
+// ---------------------------------------------------------------------------
+// Paramètres, via l'URL. Exemple :
+//   ?fps=60&q=1&stars=2200&sat=3&meteor=9&moon=1&turnmin=60&planets=1&labels=0
+// ---------------------------------------------------------------------------
+const P = new URLSearchParams(location.search);
+const num = (k, d) => (P.has(k) && !isNaN(+P.get(k))) ? +P.get(k) : d;
+const CFG = {
+  fps:     num('fps', 60),
+  q:       num('q', 0),          // 0 = définition native de l'écran ; >1 = suréchantillonnage
+  stars:   num('stars', 2200),   // étoiles fixes, pour une surface d'écran
+  twinkle: num('twinkle', 620),  // dont celles qui scintillent
+  sat:     num('sat', 3),        // satellites simultanés
+  meteor:  num('meteor', 4),     // secondes moyennes entre deux étoiles filantes
+  moon:    num('moon', 1),       // 0 = pas de lune
+  moondrift: num('moondrift', 22),  // minutes pour que la Lune fasse un tour par rapport aux étoiles
+  planets: num('planets', 1),    // planètes du système solaire
+  labels:  num('labels', 0),     // 1 = nom des planètes
+  turnmin: num('turnmin', 5),    // minutes pour un tour complet du ciel
+  drift:   num('drift', 1),      // dérive lente du ciel (0 = aucune)
+  polex:   num('polex', 0.5),    // position du pôle céleste, en fraction de l'écran
+  poley:   num('poley', 0.35),
+  haze:    num('haze', 1),       // intensité de la voie lactée
+  seed:    num('seed', 7),
+  t:       num('t', 0),          // fige la scène à cet instant (pour une capture fixe)
+};
+
+// Générateur reproductible : le même ciel à chaque lancement.
+let graine = (CFG.seed >>> 0) || 1;
+function alea(){
+  graine ^= graine << 13; graine ^= graine >>> 17; graine ^= graine << 5;
+  return ((graine >>> 0) % 100000) / 100000;
+}
+const entre = (a, b) => a + alea() * (b - a);
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d', { alpha: false });
+ctx.imageSmoothingQuality = 'high';
+
+let W = 0, H = 0;               // dimensions du rendu, en pixels
+let poleX = 0, poleY = 0;       // pôle céleste, en pixels écran
+let amplitudeDerive = 0;        // ampleur de la dérive lente du ciel
+let S = 0;                      // côté du calque de ciel (carré, pôle au centre)
+let cielFixe = null;            // fond + voie lactée + étoiles fixes
+let etoilesScintillantes = [];  // redessinées à chaque image
+let lune = null;
+let lunePhaseRendue = -1;
+let planetes = [];
+
+const ANGLE_VOIE_LACTEE = -0.42;   // inclinaison de la bande, dans le repère du ciel
+const ANGLE_ECLIPTIQUE  = 0.55;    // les planètes se rangent le long de l'écliptique
+
+// ---------------------------------------------------------------------------
+// Calque du ciel : carré, pôle céleste en son centre, pour pouvoir le faire
+// tourner sans jamais découvrir un bord.
+// ---------------------------------------------------------------------------
+function construireCiel(){
+  graine = (CFG.seed >>> 0) || 1;
+  const c = document.createElement('canvas');
+  c.width = S; c.height = S;
+  const g = c.getContext('2d');
+  const cx = S / 2, cy = S / 2;
+
+  // Fond de nuit, à peine dégradé du centre vers l'extérieur.
+  const fond = g.createRadialGradient(cx, cy, 0, cx, cy, S * 0.5);
+  fond.addColorStop(0.0, '#010206');
+  fond.addColorStop(0.7, '#02030a');
+  fond.addColorStop(1.0, '#04060e');
+  g.fillStyle = fond; g.fillRect(0, 0, S, S);
+
+  // Voie lactée : bande de nuages doux traversant tout le ciel, puis poussières sombres.
+  if(CFG.haze > 0){
+    g.save();
+    g.translate(cx, cy);
+    g.rotate(ANGLE_VOIE_LACTEE);
+    const larg = S * 0.13;
+    g.globalCompositeOperation = 'lighter';
+    for(let i = 0; i < 260; i++){
+      const x = entre(-S * 0.52, S * 0.52);
+      const y = entre(-larg, larg) * (1 - 0.4 * Math.abs(x) / (S * 0.52));
+      const r = entre(S * 0.02, S * 0.075);
+      const a = entre(0.010, 0.030) * CFG.haze;
+      const nuage = g.createRadialGradient(x, y, 0, x, y, r);
+      nuage.addColorStop(0, `rgba(150,170,215,${a})`);
+      nuage.addColorStop(0.5, `rgba(120,130,190,${a * 0.45})`);
+      nuage.addColorStop(1, 'rgba(0,0,0,0)');
+      g.fillStyle = nuage;
+      g.beginPath(); g.arc(x, y, r, 0, 6.2832); g.fill();
+    }
+    g.globalCompositeOperation = 'source-over';
+    for(let i = 0; i < 60; i++){
+      const x = entre(-S * 0.5, S * 0.5);
+      const y = entre(-larg * 0.8, larg * 0.8);
+      const r = entre(S * 0.012, S * 0.05);
+      const sombre = g.createRadialGradient(x, y, 0, x, y, r);
+      sombre.addColorStop(0, 'rgba(2,3,8,0.55)');
+      sombre.addColorStop(1, 'rgba(2,3,8,0)');
+      g.fillStyle = sombre;
+      g.beginPath(); g.arc(x, y, r, 0, 6.2832); g.fill();
+    }
+    g.restore();
+  }
+
+  // Grain : sans lui, les dégradés très sombres forment des bandes visibles.
+  ajouterGrain(g, S, S, 4);
+
+  // Étoiles fixes, en densité constante par surface d'écran.
+  const parEcran = (S * S) / (2560 * 1440);
+  const total = Math.round(CFG.stars * parEcran);
+  for(let i = 0; i < total; i++){
+    const [x, y] = positionCiel();
+    dessinerEtoile(g, x, y, magnitude(), teinte(), 1);
+  }
+
+  // Les scintillantes restent en dehors du calque : elles bougent à chaque image.
+  etoilesScintillantes = [];
+  const nbScint = Math.round(CFG.twinkle * parEcran);
+  for(let i = 0; i < nbScint; i++){
+    const [x, y] = positionCiel();
+    etoilesScintillantes.push({
+      x: x - S / 2, y: y - S / 2,          // coordonnées relatives au pôle
+      taille: magnitude() * entre(1.0, 1.6),
+      couleur: teinte(),
+      phase: entre(0, 6.2832),
+      vitesse: entre(1.3, 4.2),
+      creux: entre(0.35, 0.8),
+    });
+  }
+  return c;
+}
+
+// Bruit léger appliqué sur tout le calque (anti-bandes).
+function ajouterGrain(g, w, h, force){
+  const tuile = 256;
+  const img = g.createImageData(tuile, tuile);
+  for(let i = 0; i < img.data.length; i += 4){
+    const v = 128 + (Math.random() - 0.5) * force * 2;
+    img.data[i] = img.data[i + 1] = img.data[i + 2] = v;
+    img.data[i + 3] = 255;
+  }
+  const c = document.createElement('canvas');
+  c.width = c.height = tuile;
+  c.getContext('2d').putImageData(img, 0, 0);
+  g.save();
+  g.globalCompositeOperation = 'overlay';
+  g.globalAlpha = 0.5;
+  g.fillStyle = g.createPattern(c, 'repeat');
+  g.fillRect(0, 0, w, h);
+  g.restore();
+}
+
+// Position dans le calque de ciel, plus dense le long de la voie lactée.
+function positionCiel(){
+  for(let essai = 0; essai < 6; essai++){
+    const x = alea() * S, y = alea() * S;
+    const dx = x - S / 2, dy = y - S / 2;
+    const d = Math.abs(dy * Math.cos(ANGLE_VOIE_LACTEE) - dx * Math.sin(ANGLE_VOIE_LACTEE)) / (S * 0.32);
+    const densite = 0.35 + 0.65 * Math.exp(-d * d * 2.2) * CFG.haze;
+    if(alea() < densite) return [x, y];
+  }
+  return [alea() * S, alea() * S];
+}
+
+// Beaucoup de petites étoiles, quelques grosses.
+function magnitude(){ return 0.35 + Math.pow(alea(), 7) * 2.6; }
+
+function teinte(){
+  const t = alea();
+  if(t < 0.10) return [188, 205, 255];   // bleutée
+  if(t < 0.25) return [255, 226, 196];   // dorée
+  if(t < 0.31) return [255, 196, 168];   // orangée
+  return [246, 248, 255];                // blanche
+}
+
+function dessinerEtoile(g, x, y, taille, couleur, alpha){
+  const [r, v, b] = couleur;
+  if(taille < 0.7){
+    g.fillStyle = `rgba(${r},${v},${b},${0.55 * alpha})`;
+    g.fillRect(x, y, 1, 1);
+    return;
+  }
+  const halo = g.createRadialGradient(x, y, 0, x, y, taille * 3.2);
+  halo.addColorStop(0,    `rgba(${r},${v},${b},${0.95 * alpha})`);
+  halo.addColorStop(0.28, `rgba(${r},${v},${b},${0.35 * alpha})`);
+  halo.addColorStop(1,    'rgba(0,0,0,0)');
+  g.fillStyle = halo;
+  g.beginPath(); g.arc(x, y, taille * 3.2, 0, 6.2832); g.fill();
+
+  if(taille > 2.55){                     // aigrettes des plus brillantes
+    g.strokeStyle = `rgba(${r},${v},${b},${0.13 * alpha})`;
+    g.lineWidth = 0.8;
+    const l = taille * 6;
+    g.beginPath();
+    g.moveTo(x - l, y); g.lineTo(x + l, y);
+    g.moveTo(x, y - l); g.lineTo(x, y + l);
+    g.stroke();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// La Lune
+// ---------------------------------------------------------------------------
+function construireLune(rayon){
+  const taille = Math.ceil(rayon * 2) + 4;
+  const c = document.createElement('canvas');
+  c.width = taille; c.height = taille;
+  const g = c.getContext('2d');
+  const cx = taille / 2, cy = taille / 2;
+
+  const sol = g.createRadialGradient(cx - rayon * 0.28, cy - rayon * 0.3, rayon * 0.1, cx, cy, rayon);
+  sol.addColorStop(0.0, '#fdfaf2');
+  sol.addColorStop(0.65, '#ded9cd');
+  sol.addColorStop(1.0, '#b9b4a8');
+  g.beginPath(); g.arc(cx, cy, rayon, 0, 6.2832); g.closePath();
+  g.save(); g.clip();
+  g.fillStyle = sol; g.fillRect(0, 0, taille, taille);
+
+  for(let i = 0; i < 9; i++){                    // mers lunaires
+    const a = entre(0, 6.2832), d = entre(0, rayon * 0.72);
+    const x = cx + Math.cos(a) * d, y = cy + Math.sin(a) * d;
+    const r = entre(rayon * 0.14, rayon * 0.38);
+    const mer = g.createRadialGradient(x, y, 0, x, y, r);
+    mer.addColorStop(0, 'rgba(96,100,110,0.40)');
+    mer.addColorStop(1, 'rgba(96,100,110,0)');
+    g.fillStyle = mer;
+    g.beginPath(); g.arc(x, y, r, 0, 6.2832); g.fill();
+  }
+  for(let i = 0; i < 90; i++){                   // cratères
+    const a = entre(0, 6.2832), d = Math.sqrt(alea()) * rayon * 0.94;
+    const x = cx + Math.cos(a) * d, y = cy + Math.sin(a) * d;
+    const r = entre(rayon * 0.012, rayon * 0.075);
+    const creux = g.createRadialGradient(x + r * 0.2, y + r * 0.2, 0, x, y, r);
+    creux.addColorStop(0, 'rgba(70,70,78,0.30)');
+    creux.addColorStop(0.75, 'rgba(90,90,98,0.16)');
+    creux.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = creux;
+    g.beginPath(); g.arc(x, y, r, 0, 6.2832); g.fill();
+    g.strokeStyle = 'rgba(255,252,244,0.18)';
+    g.lineWidth = Math.max(0.5, r * 0.14);
+    g.beginPath(); g.arc(x - r * 0.12, y - r * 0.12, r * 0.92, 3.6, 5.9); g.stroke();
+  }
+  g.restore();
+  return c;
+}
+
+// Phase : la partie non éclairée est effacée, avec un terminateur adouci.
+function lunePhasee(base, rayon, phase){
+  const c = document.createElement('canvas');
+  c.width = base.width; c.height = base.height;
+  const g = c.getContext('2d');
+  g.drawImage(base, 0, 0);
+  const cx = c.width / 2, cy = c.height / 2;
+  const k = Math.cos(phase * 6.2832);
+  g.globalCompositeOperation = 'destination-out';
+  const ombre = g.createRadialGradient(cx + k * rayon * 1.02, cy, rayon * 0.96,
+                                       cx + k * rayon * 1.02, cy, rayon * 1.12);
+  ombre.addColorStop(0, 'rgba(0,0,0,1)');
+  ombre.addColorStop(0.72, 'rgba(0,0,0,0.92)');
+  ombre.addColorStop(1, 'rgba(0,0,0,0)');
+  g.fillStyle = ombre;
+  g.beginPath(); g.arc(cx + k * rayon * 1.02, cy, rayon * 1.12, 0, 6.2832); g.fill();
+  g.globalCompositeOperation = 'destination-over';
+  g.fillStyle = 'rgba(120,130,150,0.07)';       // lumière cendrée
+  g.beginPath(); g.arc(cx, cy, rayon, 0, 6.2832); g.fill();
+  return c;
+}
+
+// ---------------------------------------------------------------------------
+// Les planètes — toutes plus petites que la Lune, rangées le long de l'écliptique
+// ---------------------------------------------------------------------------
+// `taille` est un rapport au rayon de la Lune ; `distance` une fraction du rayon
+// du ciel (négative = de l'autre côté du pôle) ; `tour` le nombre de minutes
+// pour un tour complet par rapport aux étoiles (mouvement propre de la planète).
+const MODELES = [
+  { nom: 'Mercure', taille: 0.11, distance: -0.74, tour: 30, halo: '#d8cfc0', type: 'rocheuse',  sol: ['#a9a094', '#6d665c'] },
+  { nom: 'Vénus',   taille: 0.20, distance:  0.30, tour: 37, halo: '#fff3d0', type: 'voilee',    sol: ['#fdf2cf', '#d8bf8e'], phase: 0.32 },
+  { nom: 'Mars',    taille: 0.16, distance: -0.42, tour: 46, halo: '#ffb090', type: 'mars',      sol: ['#d4674a', '#8e3a26'] },
+  { nom: 'Jupiter', taille: 0.46, distance:  0.62, tour: 60, halo: '#ffe6c0', type: 'geante',    sol: ['#e8d3b0', '#b98f67'] },
+  { nom: 'Saturne', taille: 0.38, distance: -0.18, tour: 74, halo: '#ffeec8', type: 'anneaux',   sol: ['#e9dcb6', '#c0a878'] },
+  { nom: 'Uranus',  taille: 0.22, distance:  0.86, tour: 91, halo: '#c8f0f2', type: 'glacee',    sol: ['#bfe9ee', '#7fb9c4'] },
+  { nom: 'Neptune', taille: 0.21, distance: -0.94, tour: 109, halo: '#b9cdff', type: 'glacee',    sol: ['#7d9ce8', '#3f5bab'] },
+];
+
+function construirePlanete(modele, rayon){
+  // Marge large : anneaux de Saturne et halo.
+  const marge = modele.type === 'anneaux' ? rayon * 2.6 : rayon * 1.8;
+  const taille = Math.ceil((rayon + marge) * 2);
+  const c = document.createElement('canvas');
+  c.width = taille; c.height = taille;
+  const g = c.getContext('2d');
+  const cx = taille / 2, cy = taille / 2;
+  const [clair, sombre] = modele.sol;
+
+  // Halo : une planète brillante scintille moins qu'une étoile mais rayonne un peu.
+  const halo = g.createRadialGradient(cx, cy, rayon * 0.8, cx, cy, rayon * 4.2);
+  halo.addColorStop(0, hexAlpha(modele.halo, 0.22));
+  halo.addColorStop(0.4, hexAlpha(modele.halo, 0.06));
+  halo.addColorStop(1, 'rgba(0,0,0,0)');
+  g.fillStyle = halo;
+  g.beginPath(); g.arc(cx, cy, rayon * 4.2, 0, 6.2832); g.fill();
+
+  // Anneaux : la moitié arrière passe derrière la planète.
+  if(modele.type === 'anneaux') dessinerAnneaux(g, cx, cy, rayon, true);
+
+  // Disque éclairé depuis le haut-gauche.
+  g.save();
+  g.beginPath(); g.arc(cx, cy, rayon, 0, 6.2832); g.clip();
+  const sol = g.createRadialGradient(cx - rayon * 0.35, cy - rayon * 0.35, rayon * 0.05, cx, cy, rayon * 1.05);
+  sol.addColorStop(0, clair);
+  sol.addColorStop(0.75, sombre);
+  sol.addColorStop(1, assombrir(sombre, 0.45));
+  g.fillStyle = sol;
+  g.fillRect(cx - rayon, cy - rayon, rayon * 2, rayon * 2);
+
+  if(modele.type === 'geante' || modele.type === 'anneaux'){
+    // Bandes nuageuses horizontales.
+    const bandes = modele.type === 'geante' ? 9 : 7;
+    for(let i = 0; i < bandes; i++){
+      const y = cy - rayon + (i + 0.5) * (2 * rayon / bandes);
+      const h = (2 * rayon / bandes) * entre(0.45, 0.95);
+      g.globalAlpha = entre(0.10, 0.30);
+      g.fillStyle = i % 2 ? assombrir(sombre, 0.7) : eclaircir(clair, 0.25);
+      g.beginPath(); g.ellipse(cx, y, rayon * 1.05, h / 2, 0, 0, 6.2832); g.fill();
+    }
+    g.globalAlpha = 1;
+    if(modele.nom === 'Jupiter'){        // la Grande Tache rouge
+      g.globalAlpha = 0.55;
+      g.fillStyle = '#b6533c';
+      g.beginPath(); g.ellipse(cx + rayon * 0.3, cy + rayon * 0.22, rayon * 0.26, rayon * 0.14, 0, 0, 6.2832); g.fill();
+      g.globalAlpha = 1;
+    }
+  } else if(modele.type === 'mars'){
+    // Taches sombres et calottes polaires.
+    for(let i = 0; i < 7; i++){
+      const a = entre(0, 6.2832), d = entre(0, rayon * 0.7);
+      g.globalAlpha = entre(0.10, 0.26);
+      g.fillStyle = '#6a2a1c';
+      g.beginPath(); g.ellipse(cx + Math.cos(a) * d, cy + Math.sin(a) * d,
+                               rayon * entre(0.15, 0.4), rayon * entre(0.08, 0.22), a, 0, 6.2832); g.fill();
+    }
+    g.globalAlpha = 0.85;
+    g.fillStyle = '#f3f1ee';
+    g.beginPath(); g.ellipse(cx, cy - rayon * 0.93, rayon * 0.42, rayon * 0.18, 0, 0, 6.2832); g.fill();
+    g.beginPath(); g.ellipse(cx, cy + rayon * 0.95, rayon * 0.3, rayon * 0.12, 0, 0, 6.2832); g.fill();
+    g.globalAlpha = 1;
+  } else if(modele.type === 'rocheuse'){
+    for(let i = 0; i < 18; i++){        // cratères
+      const a = entre(0, 6.2832), d = Math.sqrt(alea()) * rayon * 0.9;
+      const r = entre(rayon * 0.05, rayon * 0.16);
+      g.globalAlpha = 0.22;
+      g.fillStyle = '#4f4a44';
+      g.beginPath(); g.arc(cx + Math.cos(a) * d, cy + Math.sin(a) * d, r, 0, 6.2832); g.fill();
+    }
+    g.globalAlpha = 1;
+  } else if(modele.type === 'glacee'){
+    for(let i = 0; i < 4; i++){         // bandes très douces
+      const y = cy - rayon * 0.6 + i * rayon * 0.4;
+      g.globalAlpha = 0.12;
+      g.fillStyle = i % 2 ? eclaircir(clair, 0.3) : assombrir(sombre, 0.8);
+      g.beginPath(); g.ellipse(cx, y, rayon * 1.05, rayon * 0.16, 0, 0, 6.2832); g.fill();
+    }
+    g.globalAlpha = 1;
+  }
+
+  // Terminateur : côté nuit, marqué pour Vénus et Mercure (phases visibles).
+  const phase = modele.phase || 0.12;
+  const nuit = g.createLinearGradient(cx - rayon, cy - rayon, cx + rayon, cy + rayon);
+  nuit.addColorStop(Math.min(0.95, 0.45 + phase), 'rgba(0,0,0,0)');
+  nuit.addColorStop(1, `rgba(0,0,4,${0.35 + phase})`);
+  g.fillStyle = nuit;
+  g.fillRect(cx - rayon, cy - rayon, rayon * 2, rayon * 2);
+  g.restore();
+
+  // Fin liseré lumineux du côté éclairé.
+  g.strokeStyle = hexAlpha(modele.halo, 0.35);
+  g.lineWidth = Math.max(0.6, rayon * 0.05);
+  g.beginPath(); g.arc(cx, cy, rayon * 0.98, 3.3, 5.6); g.stroke();
+
+  if(modele.type === 'anneaux') dessinerAnneaux(g, cx, cy, rayon, false);
+  return c;
+}
+
+// Anneaux de Saturne, vus de biais. `arriere` = la moitié cachée par la planète.
+function dessinerAnneaux(g, cx, cy, rayon, arriere){
+  const inclinaison = 0.30;                 // aplatissement vertical
+  const anneaux = [
+    { r1: 1.35, r2: 1.62, a: 0.30 },        // anneau C
+    { r1: 1.62, r2: 2.05, a: 0.55 },        // anneau B
+    { r1: 2.13, r2: 2.32, a: 0.34 },        // anneau A (après la division de Cassini)
+  ];
+  g.save();
+  g.translate(cx, cy);
+  g.rotate(-0.28);
+  g.scale(1, inclinaison);
+  for(const an of anneaux){
+    const grad = g.createRadialGradient(0, 0, rayon * an.r1, 0, 0, rayon * an.r2);
+    grad.addColorStop(0, `rgba(233,220,190,${an.a})`);
+    grad.addColorStop(0.5, `rgba(250,240,215,${an.a * 0.8})`);
+    grad.addColorStop(1, `rgba(200,185,155,${an.a * 0.5})`);
+    g.strokeStyle = grad;
+    g.lineWidth = rayon * (an.r2 - an.r1);
+    g.beginPath();
+    const r = rayon * (an.r1 + an.r2) / 2;
+    // moitié arrière : au-dessus de la planète ; moitié avant : en dessous
+    if(arriere) g.arc(0, 0, r, Math.PI, 6.2832);
+    else        g.arc(0, 0, r, 0, Math.PI);
+    g.stroke();
+  }
+  g.restore();
+}
+
+function hexAlpha(hex, a){
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
+}
+function assombrir(hex, f){
+  const n = parseInt(hex.slice(1), 16);
+  return `rgb(${Math.round(((n >> 16) & 255) * f)},${Math.round(((n >> 8) & 255) * f)},${Math.round((n & 255) * f)})`;
+}
+function eclaircir(hex, f){
+  const n = parseInt(hex.slice(1), 16);
+  const m = (v) => Math.round(v + (255 - v) * f);
+  return `rgb(${m((n >> 16) & 255)},${m((n >> 8) & 255)},${m(n & 255)})`;
+}
+
+// ---------------------------------------------------------------------------
+// Satellites et étoiles filantes (en coordonnées écran : ils passent devant tout)
+// ---------------------------------------------------------------------------
+let satellites = [];
+function nouveauSatellite(){
+  const bord = Math.floor(alea() * 4);
+  const marge = 40;
+  let x, y;
+  if(bord === 0){ x = -marge; y = alea() * H; }
+  else if(bord === 1){ x = W + marge; y = alea() * H; }
+  else if(bord === 2){ x = alea() * W; y = -marge; }
+  else { x = alea() * W; y = H + marge; }
+  const duree = entre(22, 55);                   // traversée franche d'un bord à l'autre
+  const cible = [alea() * W, alea() * H * 0.9];
+  const dx = cible[0] - x, dy = cible[1] - y;
+  const l = Math.hypot(dx, dy) || 1;
+  const distance = Math.hypot(W, H) * 1.3;
+  return {
+    x, y,
+    vx: dx / l * distance / duree,
+    vy: dy / l * distance / duree,
+    eclat: entre(0.45, 0.9),
+    rythme: entre(0.25, 1.1),
+    phase: entre(0, 6.2832),
+    flare: alea() < 0.25 ? entre(0.25, 0.75) : 0,
+    age: 0, duree,
+  };
+}
+
+let meteores = [];
+let prochainMeteore = 2;
+function nouveauMeteore(){
+  const x = entre(W * 0.25, W * 1.15);
+  const y = entre(-H * 0.05, H * 0.45);
+  const angle = entre(2.15, 2.95);                 // vers le bas à gauche
+  const v = entre(0.35, 0.8) * Math.hypot(W, H);   // pixels par seconde
+  return {
+    x, y,
+    vx: Math.cos(angle) * v,
+    vy: Math.sin(angle) * v,
+    vie: 0,
+    duree: entre(0.6, 1.6),
+    taille: entre(1.0, 2.4),
+    teinte: alea() < 0.22 ? [190, 225, 255] : [255, 236, 205],
+    fragmente: alea() < 0.25,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Dimensionnement
+// ---------------------------------------------------------------------------
+function redimensionner(){
+  const dpr = window.devicePixelRatio || 1;
+  const larg = innerWidth * dpr, haut = innerHeight * dpr;
+  // q = 0 : définition native (plafond ≈ 9 Mpx) ; q > 1 : suréchantillonnage.
+  const s = CFG.q > 0 ? CFG.q : Math.min(1, Math.sqrt(9.0e6 / (larg * haut)));
+  W = Math.max(2, Math.round(larg * s));
+  H = Math.max(2, Math.round(haut * s));
+  canvas.width = W; canvas.height = H;
+
+  poleX = W * CFG.polex; poleY = H * CFG.poley;
+  // Le calque doit couvrir l'écran quelle que soit la rotation : rayon = coin le plus loin.
+  amplitudeDerive = CFG.drift * Math.min(W, H) * 0.12;
+  const R = Math.max(
+    Math.hypot(poleX, poleY), Math.hypot(W - poleX, poleY),
+    Math.hypot(poleX, H - poleY), Math.hypot(W - poleX, H - poleY)) + amplitudeDerive + 4;
+  S = Math.ceil(R * 2);
+  cielFixe = construireCiel();
+
+  const rayonLune = Math.max(26, Math.min(W, H) * 0.052);
+  lune = CFG.moon ? {
+    base: construireLune(rayonLune), rayon: rayonLune, image: null,
+    distance: R * 0.55, angle: entre(0, 6.2832),
+  } : null;
+  lunePhaseRendue = -1;
+
+  planetes = [];
+  if(CFG.planets){
+    for(const m of MODELES){
+      const rayon = Math.max(3, rayonLune * m.taille);
+      planetes.push({
+        modele: m,
+        image: construirePlanete(m, rayon),
+        rayon,
+        distance: R * m.distance,          // le long de l'écliptique, de part et d'autre du pôle
+        ecart: (alea() - 0.5) * R * 0.12,  // petit écart à l'écliptique
+      });
+    }
+  }
+
+  satellites = [];
+  for(let i = 0; i < CFG.sat; i++){
+    const sat = nouveauSatellite();
+    sat.age = entre(0, sat.duree);
+    sat.x += sat.vx * sat.age; sat.y += sat.vy * sat.age;
+    satellites.push(sat);
+  }
+}
+addEventListener('resize', redimensionner);
+redimensionner();
+
+// ---------------------------------------------------------------------------
+// Boucle d'animation
+// ---------------------------------------------------------------------------
+let precedent = 0, dernierDessin = 0;
+function image(ms){
+  requestAnimationFrame(image);
+  if(ms - dernierDessin < 1000 / CFG.fps - 2) return;
+  const dt = Math.min(precedent ? (ms - precedent) / 1000 : 0.016, 0.1);
+  precedent = ms; dernierDessin = ms;
+  // Temps absolu : le ciel reste continu même après un rechargement de la page.
+  dessiner(dt, CFG.t > 0 ? CFG.t : Date.now() / 1000);
+}
+
+function dessiner(dt, T){
+  // Rotation du ciel autour du pôle céleste.
+  const angle = (T / (CFG.turnmin * 60)) * 6.2832;
+  const cosA = Math.cos(angle), sinA = Math.sin(angle);
+  // Dérive : le pôle lui-même se promène très lentement, sur deux périodes
+  // différentes, pour qu'aucune étoile ne reste jamais parfaitement immobile.
+  const px = poleX + amplitudeDerive * Math.sin(T / 41);
+  const py = poleY + amplitudeDerive * 0.75 * Math.cos(T / 59);
+  // Passage des coordonnées du ciel (relatives au pôle) vers l'écran.
+  const versEcran = (dx, dy) => [px + dx * cosA - dy * sinA, py + dx * sinA + dy * cosA];
+
+  // --- fond : étoiles fixes et voie lactée, tournés d'un bloc
+  ctx.save();
+  ctx.translate(px, py);
+  ctx.rotate(angle);
+  ctx.drawImage(cielFixe, -S / 2, -S / 2);
+  ctx.restore();
+
+  // --- étoiles qui scintillent (elles tournent avec le reste du ciel)
+  for(const e of etoilesScintillantes){
+    const [x, y] = versEcran(e.x, e.y);
+    if(x < -20 || y < -20 || x > W + 20 || y > H + 20) continue;
+    const s = 1 - e.creux * (0.5 + 0.5 * Math.sin(T * e.vitesse + e.phase));
+    dessinerEtoile(ctx, x, y, e.taille * (0.75 + 0.35 * s), e.couleur, s);
+  }
+
+  // --- planètes : elles suivent le ciel, avec en plus leur mouvement propre
+  for(const p of planetes){
+    const derive = (T / (p.modele.tour * 60)) * 6.2832;
+    const a = ANGLE_ECLIPTIQUE + derive;
+    const dx = Math.cos(a) * p.distance - Math.sin(a) * p.ecart;
+    const dy = Math.sin(a) * p.distance + Math.cos(a) * p.ecart;
+    const [x, y] = versEcran(dx, dy);
+    const m = p.image.width / 2;
+    if(x < -m || y < -m || x > W + m || y > H + m) continue;
+    ctx.drawImage(p.image, x - m, y - m);
+    if(CFG.labels){
+      ctx.fillStyle = 'rgba(200,215,245,0.45)';
+      ctx.font = `${Math.max(11, p.rayon * 0.9)}px -apple-system, sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.fillText(p.modele.nom, x, y + p.rayon * 2.2 + 12);
+    }
+  }
+
+  // --- la Lune : elle suit le ciel et dérive lentement par rapport aux étoiles
+  if(lune){
+    const a = lune.angle + (T / (CFG.moondrift * 60)) * 6.2832;
+    const [x, y] = versEcran(Math.cos(a) * lune.distance, Math.sin(a) * lune.distance);
+    const m = lune.rayon * 6.5;
+    if(x > -m && y > -m && x < W + m && y < H + m){
+      const phase = 0.5 + 0.16 * Math.sin(T / 3600);   // la phase évolue très lentement
+      if(Math.abs(phase - lunePhaseRendue) > 0.004){
+        lune.image = lunePhasee(lune.base, lune.rayon, phase);
+        lunePhaseRendue = phase;
+      }
+      const halo = ctx.createRadialGradient(x, y, lune.rayon * 0.6, x, y, m);
+      halo.addColorStop(0, 'rgba(200,215,255,0.16)');
+      halo.addColorStop(0.35, 'rgba(170,190,240,0.05)');
+      halo.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = halo;
+      ctx.beginPath(); ctx.arc(x, y, m, 0, 6.2832); ctx.fill();
+      ctx.drawImage(lune.image, x - lune.image.width / 2, y - lune.image.height / 2);
+    }
+  }
+
+  // --- satellites
+  for(let i = satellites.length - 1; i >= 0; i--){
+    const s = satellites[i];
+    s.age += dt;
+    s.x += s.vx * dt; s.y += s.vy * dt;
+    const marge = 60;
+    if(s.age > s.duree * 1.4 || s.x < -marge || s.x > W + marge || s.y < -marge || s.y > H + marge){
+      satellites[i] = nouveauSatellite();
+      continue;
+    }
+    let eclat = s.eclat * (0.45 + 0.55 * Math.abs(Math.sin(T * s.rythme + s.phase)));
+    if(s.flare){
+      const d = Math.abs(s.age / s.duree - s.flare);
+      eclat += 1.6 * Math.exp(-d * d * 900);
+    }
+    const r = 1.1 + eclat * 1.2;
+    const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, r * 3.6);
+    g.addColorStop(0, `rgba(255,255,250,${Math.min(1, eclat)})`);
+    g.addColorStop(0.3, `rgba(210,225,255,${Math.min(1, eclat) * 0.35})`);
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(s.x, s.y, r * 3.6, 0, 6.2832); ctx.fill();
+  }
+
+  // --- étoiles filantes
+  prochainMeteore -= dt;
+  if(prochainMeteore <= 0){
+    meteores.push(nouveauMeteore());
+    prochainMeteore = alea() < 0.18 ? entre(0.3, 1.2) : entre(CFG.meteor * 0.45, CFG.meteor * 1.7);
+  }
+  for(let i = meteores.length - 1; i >= 0; i--){
+    const m = meteores[i];
+    m.vie += dt;
+    if(m.vie > m.duree){ meteores.splice(i, 1); continue; }
+    const t = m.vie / m.duree;
+    const opacite = Math.sin(Math.PI * Math.min(1, t * 1.25));
+    const x = m.x + m.vx * m.vie, y = m.y + m.vy * m.vie;
+    const v = Math.hypot(m.vx, m.vy);
+    const lg = v * Math.min(0.30, m.duree * 0.4);
+    const qx = x - m.vx / v * lg, qy = y - m.vy / v * lg;
+    const [cr, cv, cb] = m.teinte;
+
+    const trainee = ctx.createLinearGradient(x, y, qx, qy);
+    trainee.addColorStop(0, `rgba(${cr},${cv},${cb},${0.9 * opacite})`);
+    trainee.addColorStop(0.35, `rgba(${cr},${cv},${cb},${0.25 * opacite})`);
+    trainee.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.strokeStyle = trainee;
+    ctx.lineWidth = m.taille;
+    ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(qx, qy); ctx.stroke();
+
+    const tete = ctx.createRadialGradient(x, y, 0, x, y, m.taille * 6);
+    tete.addColorStop(0, `rgba(255,255,255,${opacite})`);
+    tete.addColorStop(0.3, `rgba(${cr},${cv},${cb},${0.45 * opacite})`);
+    tete.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = tete;
+    ctx.beginPath(); ctx.arc(x, y, m.taille * 6, 0, 6.2832); ctx.fill();
+
+    if(m.fragmente && t > 0.75){
+      for(let k = 0; k < 3; k++){
+        const a = (k / 3) * 6.2832 + m.vie * 3;
+        const d = (t - 0.75) * 90;
+        ctx.fillStyle = `rgba(${cr},${cv},${cb},${0.5 * (1 - t) * opacite})`;
+        ctx.beginPath(); ctx.arc(x + Math.cos(a) * d, y + Math.sin(a) * d, m.taille * 0.9, 0, 6.2832); ctx.fill();
+      }
+    }
+  }
+}
+
+requestAnimationFrame(image);
+
+// Dessin piloté de l'extérieur : dans un économiseur d'écran, WebKit considère la
+// page comme masquée et arrête requestAnimationFrame. L'hôte appelle alors cette
+// fonction à chaque image.
+window.dessinerUneImage = (secondes) => {
+  const T = secondes || Date.now() / 1000;
+  dessiner(1 / 60, T);
+  return 1;
+};
+})();
+</script>
+</body>
+</html>
