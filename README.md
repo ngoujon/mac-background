@@ -12,6 +12,14 @@ macOS 14 or later. It lives in the menu bar, with no Dock icon.
 
 ---
 
+## Screenshots
+
+*The three bundled animated wallpapers, rendered from `Fonds/` (one per screen in a multi-monitor setup).*
+
+| Starry sky | Galaxies | Black hole |
+| --- | --- | --- |
+| ![Starry sky](docs/screenshots/starry-sky.jpg) | ![Galaxies](docs/screenshots/galaxies.jpg) | ![Black hole](docs/screenshots/black-hole.jpg) |
+
 ## Installation
 
 ```bash
